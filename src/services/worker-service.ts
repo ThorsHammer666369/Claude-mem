@@ -556,6 +556,7 @@ export class WorkerService implements WorkerRef {
     }
 
     let hadUnrecoverableError = false;
+    let hadContextOverflowError = false;
     let sessionFailed = false;
 
     logger.info('SYSTEM', `Starting generator (${source}) using ${providerName}`, { sessionId: sid });
@@ -585,8 +586,9 @@ export class WorkerService implements WorkerRef {
           ? 'unrecoverable'
           : (classified ? classified.kind : null);
 
-        if (dispatchKind === 'unrecoverable' || dispatchKind === 'auth_invalid' || dispatchKind === 'quota_exhausted') {
+        if (dispatchKind === 'unrecoverable' || dispatchKind === 'auth_invalid' || dispatchKind === 'quota_exhausted' || dispatchKind === 'context_overflow') {
           hadUnrecoverableError = true;
+          hadContextOverflowError = dispatchKind === 'context_overflow';
           this.lastAiInteraction = {
             timestamp: Date.now(),
             success: false,
@@ -595,7 +597,8 @@ export class WorkerService implements WorkerRef {
           };
           const logLabel =
             dispatchKind === 'auth_invalid' ? 'auth invalid' :
-            dispatchKind === 'quota_exhausted' ? 'quota exhausted' : 'unrecoverable';
+            dispatchKind === 'quota_exhausted' ? 'quota exhausted' :
+            dispatchKind === 'context_overflow' ? 'context overflow' : 'unrecoverable';
           logger.error('SDK', `Unrecoverable generator error (${logLabel}) - will NOT restart`, {
             sessionId: session.sessionDbId,
             project: session.project,
@@ -652,7 +655,8 @@ export class WorkerService implements WorkerRef {
         // Translate worker-service-specific error flags into the canonical reason enum.
         let reason = session.abortReason ?? null;
         session.abortReason = null;
-        if (hadUnrecoverableError) reason = 'restart-guard';
+        if (hadContextOverflowError) reason = 'overflow';
+        else if (hadUnrecoverableError) reason = 'restart-guard';
         if (session.idleTimedOut) {
           session.idleTimedOut = false;
           reason = reason ?? 'idle';
@@ -756,6 +760,7 @@ export class WorkerService implements WorkerRef {
   broadcastProcessingStatus(): void {
     void (async () => {
       const queueDepth = await this.sessionManager.getTotalActiveWork();
+      const queueStats = await this.sessionManager.getQueueStats().catch(() => null);
       const isProcessing = queueDepth > 0;
       const activeSessions = this.sessionManager.getActiveSessionCount();
 
@@ -768,7 +773,8 @@ export class WorkerService implements WorkerRef {
       this.sseBroadcaster.broadcast({
         type: 'processing_status',
         isProcessing,
-        queueDepth
+        queueDepth,
+        queueStats
       });
     })();
   }

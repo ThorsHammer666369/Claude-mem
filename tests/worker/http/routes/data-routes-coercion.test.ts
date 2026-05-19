@@ -5,9 +5,30 @@ import { logger } from '../../../../src/utils/logger.js';
 
 mock.module('../../../../src/shared/paths.js', () => ({
   getPackageRoot: () => '/tmp/test',
+  USER_SETTINGS_PATH: '/tmp/test/settings.json',
+  paths: {
+    database: () => '/tmp/test/claude-mem.db',
+  },
 }));
 mock.module('../../../../src/shared/worker-utils.js', () => ({
   getWorkerPort: () => 37777,
+}));
+mock.module('../../../../src/shared/SettingsDefaultsManager.js', () => ({
+  SettingsDefaultsManager: {
+    loadFromFile: () => ({
+      CLAUDE_MEM_LLM_QUEUE_MODE: 'auto',
+      CLAUDE_MEM_LLM_MIN_SEND_INTERVAL_MS: '0',
+      CLAUDE_MEM_LLM_BATCH_MAX_ITEMS: '3',
+      CLAUDE_MEM_LLM_BATCH_MAX_CHARS: '24000',
+      CLAUDE_MEM_LLM_COALESCE_WINDOW_MS: '5000',
+      CLAUDE_MEM_LLM_ADAPTIVE_BACKOFF: 'true',
+      CLAUDE_MEM_LLM_MAX_ATTEMPTS: '3',
+      CLAUDE_MEM_QUEUE_HIGH_WATERMARK: '200',
+      CLAUDE_MEM_QUEUE_CRITICAL_WATERMARK: '1000',
+      CLAUDE_MEM_QUEUE_DROP_POLICY: 'coalesce_low_value',
+      CLAUDE_MEM_QUEUE_METRICS_ENABLED: 'true',
+    }),
+  },
 }));
 
 import { DataRoutes } from '../../../../src/services/worker/http/routes/DataRoutes.js';
@@ -47,6 +68,18 @@ function captureChain(mockApp: any, targetPath: string): (req: Request, res: Res
       nextCalled = true;
     });
     if (nextCalled) handler(req, res);
+  };
+}
+
+function captureGet(mockApp: any, targetPath: string): (req: Request, res: Response) => Promise<void> {
+  let handler: (req: Request, res: Response) => Promise<void> | void;
+  mockApp.get = mock((path: string, candidate: any) => {
+    if (path === targetPath) {
+      handler = candidate;
+    }
+  });
+  return async (req: Request, res: Response): Promise<void> => {
+    await handler(req, res);
   };
 }
 
@@ -217,6 +250,64 @@ describe('DataRoutes Type Coercion', () => {
       handler(req as Request, res as Response);
 
       expect(statusSpy).toHaveBeenCalledWith(400);
+    });
+  });
+
+  describe('handleGetQueueStatus', () => {
+    it('returns queue pressure and provider drain metrics', async () => {
+      const getQueueStats = mock(() => Promise.resolve({
+        totalPending: 5,
+        totalProcessing: 1,
+        totalDelayed: 2,
+        totalFailed: 3,
+        oldestPendingAgeMs: 4000,
+        maxAttemptCount: 2,
+        sessions: [{
+          sessionDbId: 7,
+          pending: 5,
+          processing: 1,
+          delayed: 2,
+          failed: 3,
+          oldestPendingAgeMs: 4000,
+          maxAttemptCount: 2,
+        }],
+      }));
+      routes = new DataRoutes(
+        {} as any,
+        {} as any,
+        { getQueueStats } as any,
+        {} as any,
+        {} as any,
+        Date.now()
+      );
+
+      const mockApp: any = {
+        post: mock(() => {}),
+        delete: mock(() => {}),
+        use: mock(() => {}),
+      };
+      const handler = captureGet(mockApp, '/api/queue/status');
+      routes.setupRoutes(mockApp as any);
+
+      const { req, res, jsonSpy } = createMockReqRes({});
+      await handler(req as Request, res as Response);
+
+      expect(getQueueStats).toHaveBeenCalled();
+      expect(jsonSpy).toHaveBeenCalledWith(expect.objectContaining({
+        totalPending: 5,
+        totalProcessing: 1,
+        totalFailed: 3,
+        provider: expect.objectContaining({
+          mode: 'auto',
+          minSendIntervalMs: expect.any(Number),
+          currentBackoffMs: expect.any(Number),
+        }),
+        pressure: expect.objectContaining({
+          highWatermark: expect.any(Number),
+          criticalWatermark: expect.any(Number),
+          dropPolicy: 'coalesce_low_value',
+        }),
+      }));
     });
   });
 });

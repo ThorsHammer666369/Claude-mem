@@ -108,7 +108,12 @@ describe('GeminiProvider', () => {
 
     mockSessionManager = {
       getMessageIterator: async function* () { yield* []; },
-      getPendingMessageStore: () => mockPendingMessageStore
+      getPendingMessageStore: () => mockPendingMessageStore,
+      confirmClaimedMessages: mock(() => Promise.resolve(0)),
+      confirmClaimedMessageIds: mock(() => Promise.resolve(0)),
+      retryOrFailClaimedMessages: mock(() => Promise.resolve({ retried: 0, failed: 0 })),
+      retryOrFailClaimedMessageIds: mock(() => Promise.resolve({ retried: 0, failed: 0 })),
+      getTotalQueueDepth: mock(() => Promise.resolve(0)),
     } as unknown as SessionManager;
 
     agent = new GeminiProvider(mockDbManager, mockSessionManager);
@@ -230,6 +235,508 @@ describe('GeminiProvider', () => {
     expect(mockStoreObservations).toHaveBeenCalled();
     expect(mockSyncObservation).toHaveBeenCalled();
     expect(session.cumulativeInputTokens).toBeGreaterThan(0);
+  });
+
+  it('splits an oversized queued observation into multiple provider requests before confirming claims', async () => {
+    loadFromFileSpy.mockImplementation(() => ({
+      ...SettingsDefaultsManager.getAllDefaults(),
+      CLAUDE_MEM_GEMINI_API_KEY: 'test-api-key',
+      CLAUDE_MEM_GEMINI_MODEL: 'gemini-2.5-flash-lite',
+      CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED: 'false',
+      CLAUDE_MEM_DATA_DIR: '/tmp/claude-mem-test',
+      CLAUDE_MEM_LLM_QUEUE_MODE: 'auto',
+      CLAUDE_MEM_LLM_CONTEXT_SPLIT_ENABLED: 'true',
+      CLAUDE_MEM_LLM_CONTEXT_MAX_CHARS: '1200',
+      CLAUDE_MEM_LLM_CONTEXT_SPLIT_MAX_PARTS: '20',
+    }));
+
+    const confirmClaimedMessages = mock(() => Promise.resolve(1));
+    const confirmClaimedMessageIds = mock(() => Promise.resolve(1));
+    mockSessionManager = {
+      ...mockSessionManager,
+      getMessageIterator: async function* () {
+        yield {
+          type: 'observation',
+          tool_name: 'Bash',
+          tool_input: { command: 'npm test' },
+          tool_response: {
+            stdout: Array.from({ length: 100 }, (_, index) => `large output line ${index + 1}`).join('\n'),
+            stderr: '',
+            exitCode: 0,
+          },
+          prompt_number: 2,
+          cwd: 'C:/repo',
+          _persistentId: 77,
+          _originalTimestamp: 1700000000000,
+        };
+      },
+      confirmClaimedMessages,
+      confirmClaimedMessageIds,
+    } as unknown as SessionManager;
+    agent = new GeminiProvider(mockDbManager, mockSessionManager);
+
+    const session = {
+      sessionDbId: 1,
+      contentSessionId: 'test-session',
+      memorySessionId: 'mem-session-123',
+      project: 'test-project',
+      userPrompt: 'test prompt',
+      conversationHistory: [],
+      lastPromptNumber: 1,
+      cumulativeInputTokens: 0,
+      cumulativeOutputTokens: 0,
+      pendingMessages: [],
+      abortController: new AbortController(),
+      generatorPromise: null,
+      currentProvider: null,
+      startTime: Date.now(),
+      earliestPendingTimestamp: 1700000000000,
+      claimedMessageIds: [77],
+    } as any;
+
+    const observationXml = (title: string) => `
+      <observation>
+        <type>discovery</type>
+        <title>${title}</title>
+        <narrative>${title} narrative</narrative>
+        <facts></facts>
+        <concepts></concepts>
+        <files_read></files_read>
+        <files_modified></files_modified>
+      </observation>
+    `;
+    let requestCount = 0;
+    global.fetch = mock(() => {
+      requestCount++;
+      const text = requestCount === 1 ? '' : observationXml(`split response ${requestCount - 1}`);
+      return Promise.resolve(new Response(JSON.stringify({
+        candidates: [{ content: { parts: [{ text }] } }],
+        usageMetadata: { totalTokenCount: 50 }
+      })));
+    });
+
+    await agent.startSession(session);
+
+    expect((global.fetch as any).mock.calls.length).toBeGreaterThan(2);
+    const observationBodies = (global.fetch as any).mock.calls.slice(1).map((call: any[]) => JSON.parse(call[1].body));
+    expect(observationBodies.every((body: any) => JSON.stringify(body).includes('splitMetadata'))).toBe(true);
+    expect(observationBodies.every((body: any) => JSON.stringify(body).includes('context-77-single-observation'))).toBe(true);
+    expect(confirmClaimedMessages).not.toHaveBeenCalled();
+    expect(confirmClaimedMessageIds).toHaveBeenCalledWith(1, [77]);
+  });
+
+  it('retries a provider context overflow once with a smaller split budget', async () => {
+    loadFromFileSpy.mockImplementation(() => ({
+      ...SettingsDefaultsManager.getAllDefaults(),
+      CLAUDE_MEM_GEMINI_API_KEY: 'test-api-key',
+      CLAUDE_MEM_GEMINI_MODEL: 'gemini-2.5-flash-lite',
+      CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED: 'false',
+      CLAUDE_MEM_DATA_DIR: '/tmp/claude-mem-test',
+      CLAUDE_MEM_LLM_QUEUE_MODE: 'auto',
+      CLAUDE_MEM_LLM_CONTEXT_SPLIT_ENABLED: 'true',
+      CLAUDE_MEM_LLM_CONTEXT_MAX_CHARS: '5000',
+      CLAUDE_MEM_LLM_CONTEXT_SPLIT_MAX_PARTS: '20',
+    }));
+
+    const confirmClaimedMessages = mock(() => Promise.resolve(1));
+    const confirmClaimedMessageIds = mock(() => Promise.resolve(1));
+    mockSessionManager = {
+      ...mockSessionManager,
+      getMessageIterator: async function* () {
+        yield {
+          type: 'observation',
+          tool_name: 'Bash',
+          tool_input: { command: 'npm test' },
+          tool_response: {
+            stdout: Array.from({ length: 150 }, (_, index) => `retry overflow line ${index + 1}`).join('\n'),
+            stderr: '',
+            exitCode: 0,
+          },
+          prompt_number: 2,
+          cwd: 'C:/repo',
+          _persistentId: 88,
+          _originalTimestamp: 1700000000000,
+        };
+      },
+      confirmClaimedMessages,
+      confirmClaimedMessageIds,
+    } as unknown as SessionManager;
+    agent = new GeminiProvider(mockDbManager, mockSessionManager);
+
+    const session = {
+      sessionDbId: 1,
+      contentSessionId: 'test-session',
+      memorySessionId: 'mem-session-123',
+      project: 'test-project',
+      userPrompt: 'test prompt',
+      conversationHistory: [],
+      lastPromptNumber: 1,
+      cumulativeInputTokens: 0,
+      cumulativeOutputTokens: 0,
+      pendingMessages: [],
+      abortController: new AbortController(),
+      generatorPromise: null,
+      currentProvider: null,
+      startTime: Date.now(),
+      earliestPendingTimestamp: 1700000000000,
+      claimedMessageIds: [88],
+    } as any;
+
+    const observationXml = (title: string) => `
+      <observation>
+        <type>discovery</type>
+        <title>${title}</title>
+        <narrative>${title} narrative</narrative>
+        <facts></facts>
+        <concepts></concepts>
+        <files_read></files_read>
+        <files_modified></files_modified>
+      </observation>
+    `;
+    let requestCount = 0;
+    global.fetch = mock(() => {
+      requestCount++;
+      if (requestCount === 1) {
+        return Promise.resolve(new Response(JSON.stringify({
+          candidates: [{ content: { parts: [{ text: '' }] } }],
+        })));
+      }
+      if (requestCount === 2) {
+        return Promise.resolve(new Response(
+          'input token count exceeds the maximum context window for this model',
+          { status: 400 }
+        ));
+      }
+      return Promise.resolve(new Response(JSON.stringify({
+        candidates: [{ content: { parts: [{ text: observationXml(`overflow retry part ${requestCount - 2}`) }] } }],
+        usageMetadata: { totalTokenCount: 50 }
+      })));
+    });
+
+    await agent.startSession(session);
+
+    expect((global.fetch as any).mock.calls.length).toBeGreaterThan(3);
+    const sentBodies = (global.fetch as any).mock.calls.map((call: any[]) => JSON.parse(call[1].body));
+    const retryBodies = sentBodies.slice(2);
+    expect(retryBodies.length).toBeGreaterThan(1);
+    expect(retryBodies.every((body: any) => JSON.stringify(body).includes('splitMetadata'))).toBe(true);
+    expect(retryBodies.every((body: any) => JSON.stringify(body).includes('context-88-single-observation'))).toBe(true);
+    expect(sentBodies[2].contents.filter((entry: any) => JSON.stringify(entry).includes('retry overflow line 150'))).toHaveLength(0);
+    expect(confirmClaimedMessages).not.toHaveBeenCalled();
+    expect(confirmClaimedMessageIds).toHaveBeenCalledWith(1, [88]);
+  });
+
+  it('retry/dead-letters a queued item when the smaller context split still overflows', async () => {
+    loadFromFileSpy.mockImplementation(() => ({
+      ...SettingsDefaultsManager.getAllDefaults(),
+      CLAUDE_MEM_GEMINI_API_KEY: 'test-api-key',
+      CLAUDE_MEM_GEMINI_MODEL: 'gemini-2.5-flash-lite',
+      CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED: 'false',
+      CLAUDE_MEM_DATA_DIR: '/tmp/claude-mem-test',
+      CLAUDE_MEM_LLM_QUEUE_MODE: 'auto',
+      CLAUDE_MEM_LLM_CONTEXT_SPLIT_ENABLED: 'true',
+      CLAUDE_MEM_LLM_CONTEXT_MAX_CHARS: '5000',
+      CLAUDE_MEM_LLM_CONTEXT_SPLIT_MAX_PARTS: '20',
+      CLAUDE_MEM_LLM_MAX_ATTEMPTS: '3',
+      CLAUDE_MEM_LLM_MIN_SEND_INTERVAL_MS: '1500',
+    }));
+
+    const confirmClaimedMessages = mock(() => Promise.resolve(1));
+    const confirmClaimedMessageIds = mock(() => Promise.resolve(1));
+    const retryOrFailClaimedMessageIds = mock(() => Promise.resolve({ retried: 1, failed: 0 }));
+    mockSessionManager = {
+      ...mockSessionManager,
+      getMessageIterator: async function* () {
+        yield {
+          type: 'observation',
+          tool_name: 'Bash',
+          tool_input: { command: 'npm test' },
+          tool_response: {
+            stdout: Array.from({ length: 150 }, (_, index) => `second overflow line ${index + 1}`).join('\n'),
+            stderr: '',
+            exitCode: 0,
+          },
+          prompt_number: 2,
+          cwd: 'C:/repo',
+          _persistentId: 89,
+          _originalTimestamp: 1700000000000,
+        };
+      },
+      confirmClaimedMessages,
+      confirmClaimedMessageIds,
+      retryOrFailClaimedMessageIds,
+    } as unknown as SessionManager;
+    agent = new GeminiProvider(mockDbManager, mockSessionManager);
+
+    const session = {
+      sessionDbId: 1,
+      contentSessionId: 'test-session',
+      memorySessionId: 'mem-session-123',
+      project: 'test-project',
+      userPrompt: 'test prompt',
+      conversationHistory: [],
+      lastPromptNumber: 1,
+      cumulativeInputTokens: 0,
+      cumulativeOutputTokens: 0,
+      pendingMessages: [],
+      abortController: new AbortController(),
+      generatorPromise: null,
+      currentProvider: null,
+      startTime: Date.now(),
+      earliestPendingTimestamp: 1700000000000,
+      claimedMessageIds: [89],
+    } as any;
+
+    let requestCount = 0;
+    global.fetch = mock(() => {
+      requestCount++;
+      if (requestCount === 1) {
+        return Promise.resolve(new Response(JSON.stringify({
+          candidates: [{ content: { parts: [{ text: '' }] } }],
+        })));
+      }
+      return Promise.resolve(new Response(
+        'input token count exceeds the maximum context window for this model',
+        { status: 400 }
+      ));
+    });
+
+    await agent.startSession(session);
+
+    expect((global.fetch as any).mock.calls.length).toBeGreaterThan(2);
+    expect(confirmClaimedMessages).not.toHaveBeenCalled();
+    expect(confirmClaimedMessageIds).not.toHaveBeenCalled();
+    expect(retryOrFailClaimedMessageIds).toHaveBeenCalledTimes(1);
+    expect(retryOrFailClaimedMessageIds).toHaveBeenCalledWith(
+      1,
+      [89],
+      'context_overflow',
+      3,
+      expect.any(Number)
+    );
+  });
+
+  it('does not retry original queue ids after a later retry split part overflows', async () => {
+    loadFromFileSpy.mockImplementation(() => ({
+      ...SettingsDefaultsManager.getAllDefaults(),
+      CLAUDE_MEM_GEMINI_API_KEY: 'test-api-key',
+      CLAUDE_MEM_GEMINI_MODEL: 'gemini-2.5-flash-lite',
+      CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED: 'false',
+      CLAUDE_MEM_DATA_DIR: '/tmp/claude-mem-test',
+      CLAUDE_MEM_LLM_QUEUE_MODE: 'auto',
+      CLAUDE_MEM_LLM_CONTEXT_SPLIT_ENABLED: 'true',
+      CLAUDE_MEM_LLM_CONTEXT_MAX_CHARS: '5000',
+      CLAUDE_MEM_LLM_CONTEXT_SPLIT_MAX_PARTS: '20',
+      CLAUDE_MEM_LLM_MAX_ATTEMPTS: '3',
+    }));
+
+    const confirmClaimedMessages = mock(() => Promise.resolve(1));
+    const confirmClaimedMessageIds = mock(() => Promise.resolve(1));
+    const retryOrFailClaimedMessageIds = mock(() => Promise.resolve({ retried: 1, failed: 0 }));
+    mockSessionManager = {
+      ...mockSessionManager,
+      getMessageIterator: async function* () {
+        yield {
+          type: 'observation',
+          tool_name: 'Bash',
+          tool_input: { command: 'npm test' },
+          tool_response: {
+            stdout: Array.from({ length: 150 }, (_, index) => `retry overflow line ${index + 1}`).join('\n'),
+            stderr: '',
+            exitCode: 0,
+          },
+          prompt_number: 2,
+          cwd: 'C:/repo',
+          _persistentId: 90,
+          _originalTimestamp: 1700000000000,
+        };
+      },
+      confirmClaimedMessages,
+      confirmClaimedMessageIds,
+      retryOrFailClaimedMessageIds,
+    } as unknown as SessionManager;
+    agent = new GeminiProvider(mockDbManager, mockSessionManager);
+
+    const session = {
+      sessionDbId: 1,
+      contentSessionId: 'test-session',
+      memorySessionId: 'mem-session-123',
+      project: 'test-project',
+      userPrompt: 'test prompt',
+      conversationHistory: [],
+      lastPromptNumber: 1,
+      cumulativeInputTokens: 0,
+      cumulativeOutputTokens: 0,
+      pendingMessages: [],
+      abortController: new AbortController(),
+      generatorPromise: null,
+      currentProvider: null,
+      startTime: Date.now(),
+      earliestPendingTimestamp: 1700000000000,
+      claimedMessageIds: [90],
+    } as any;
+
+    const observationXml = (title: string) => `
+      <observation>
+        <type>discovery</type>
+        <title>${title}</title>
+        <narrative>${title} narrative</narrative>
+        <facts></facts>
+        <concepts></concepts>
+        <files_read></files_read>
+        <files_modified></files_modified>
+      </observation>
+    `;
+    let requestCount = 0;
+    global.fetch = mock(() => {
+      requestCount++;
+      if (requestCount === 1) {
+        return Promise.resolve(new Response(JSON.stringify({
+          candidates: [{ content: { parts: [{ text: '' }] } }],
+        })));
+      }
+      if (requestCount === 2 || requestCount === 4) {
+        return Promise.resolve(new Response(
+          'input token count exceeds the maximum context window for this model',
+          { status: 400 }
+        ));
+      }
+      return Promise.resolve(new Response(JSON.stringify({
+        candidates: [{ content: { parts: [{ text: observationXml('partial retry split part') }] } }],
+        usageMetadata: { totalTokenCount: 50 }
+      })));
+    });
+
+    await expect(agent.startSession(session)).rejects.toThrow(/context overflow/i);
+
+    expect((global.fetch as any).mock.calls.length).toBeGreaterThan(3);
+    expect(mockStoreObservations).toHaveBeenCalled();
+    expect(confirmClaimedMessages).not.toHaveBeenCalled();
+    expect(confirmClaimedMessageIds).not.toHaveBeenCalled();
+    expect(retryOrFailClaimedMessageIds).not.toHaveBeenCalled();
+    expect(session.splitGroupProgress).toBeNull();
+  });
+
+  it('removes the summary prompt from conversation history when the summary provider call fails', async () => {
+    const marker = 'UNIQUE_SUMMARY_ERROR_MARKER';
+    mockSessionManager = {
+      ...mockSessionManager,
+      getMessageIterator: async function* () {
+        yield {
+          type: 'summarize',
+          last_assistant_message: marker,
+          _persistentId: 91,
+          _originalTimestamp: 1700000000000,
+        };
+      },
+    } as unknown as SessionManager;
+    agent = new GeminiProvider(mockDbManager, mockSessionManager);
+
+    const session = {
+      sessionDbId: 1,
+      contentSessionId: 'test-session',
+      memorySessionId: 'mem-session-123',
+      project: 'test-project',
+      userPrompt: 'test prompt',
+      conversationHistory: [],
+      lastPromptNumber: 1,
+      cumulativeInputTokens: 0,
+      cumulativeOutputTokens: 0,
+      pendingMessages: [],
+      abortController: new AbortController(),
+      generatorPromise: null,
+      currentProvider: null,
+      startTime: Date.now(),
+      earliestPendingTimestamp: 1700000000000,
+      claimedMessageIds: [91],
+    } as any;
+
+    let requestCount = 0;
+    global.fetch = mock(() => {
+      requestCount++;
+      if (requestCount === 1) {
+        return Promise.resolve(new Response(JSON.stringify({
+          candidates: [{ content: { parts: [{ text: '' }] } }],
+        })));
+      }
+      return Promise.resolve(new Response(
+        'input token count exceeds the maximum context window for this model',
+        { status: 400 }
+      ));
+    });
+
+    await expect(agent.startSession(session)).rejects.toThrow(/context overflow/i);
+
+    expect((global.fetch as any).mock.calls.length).toBe(2);
+    expect(session.conversationHistory.some((message: any) => message.content.includes(marker))).toBe(false);
+  });
+
+  it('records a valid queued observation assistant response only once in conversation history', async () => {
+    mockSessionManager = {
+      ...mockSessionManager,
+      getMessageIterator: async function* () {
+        yield {
+          type: 'observation',
+          tool_name: 'Bash',
+          tool_input: { command: 'npm test' },
+          tool_response: { stdout: 'ok', stderr: '', exitCode: 0 },
+          prompt_number: 2,
+          cwd: 'C:/repo',
+          _persistentId: 92,
+          _originalTimestamp: 1700000000000,
+        };
+      },
+      confirmClaimedMessages: mock(() => Promise.resolve(1)),
+      confirmClaimedMessageIds: mock(() => Promise.resolve(1)),
+    } as unknown as SessionManager;
+    agent = new GeminiProvider(mockDbManager, mockSessionManager);
+
+    const session = {
+      sessionDbId: 1,
+      contentSessionId: 'test-session',
+      memorySessionId: 'mem-session-123',
+      project: 'test-project',
+      userPrompt: 'test prompt',
+      conversationHistory: [],
+      lastPromptNumber: 1,
+      cumulativeInputTokens: 0,
+      cumulativeOutputTokens: 0,
+      pendingMessages: [],
+      abortController: new AbortController(),
+      generatorPromise: null,
+      currentProvider: null,
+      startTime: Date.now(),
+      earliestPendingTimestamp: 1700000000000,
+      claimedMessageIds: [92],
+    } as any;
+
+    const observationXml = `
+      <observation>
+        <type>discovery</type>
+        <title>single history entry</title>
+        <narrative>single history entry narrative</narrative>
+        <facts></facts>
+        <concepts></concepts>
+        <files_read></files_read>
+        <files_modified></files_modified>
+      </observation>
+    `;
+    let requestCount = 0;
+    global.fetch = mock(() => {
+      requestCount++;
+      const text = requestCount === 1 ? '' : observationXml;
+      return Promise.resolve(new Response(JSON.stringify({
+        candidates: [{ content: { parts: [{ text }] } }],
+        usageMetadata: { totalTokenCount: 50 }
+      })));
+    });
+
+    await agent.startSession(session);
+
+    const matchingAssistantMessages = session.conversationHistory.filter(
+      (message: any) => message.role === 'assistant' && message.content === observationXml
+    );
+    expect(matchingAssistantMessages).toHaveLength(1);
   });
 
   it('should throw on rate limit (429) error — no Claude fallback (#2087)', async () => {

@@ -1,5 +1,5 @@
 
-import { buildContinuationPrompt, buildInitPrompt, buildObservationPrompt, buildSummaryPrompt } from '../../sdk/prompts.js';
+import { buildContinuationPrompt, buildInitPrompt, buildSummaryPrompt } from '../../sdk/prompts.js';
 import { getCredential } from '../../shared/EnvManager.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH } from '../../shared/paths.js';
@@ -14,10 +14,25 @@ import {
   processAgentResponse,
   type WorkerRef
 } from './agents/index.js';
-import { ClassifiedProviderError } from './provider-errors.js';
+import { ClassifiedProviderError, isContextOverflowMessage, isProviderContextOverflowError } from './provider-errors.js';
 import { withRetry } from './retry.js';
+import { SmartLlmDrain, type DrainItem, type SmartLlmDrainOptions } from './llm/SmartLlmDrain.js';
+import { parseSmartLlmDrainOptions } from './llm/SmartLlmDrainSettings.js';
+import { SmartLlmContextSplitter } from './llm/SmartLlmContextSplitter.js';
+import { buildContextOverflowRetryPlan } from './llm/SmartLlmContextOverflowRetry.js';
+import {
+  buildObservationPromptFromDrainItem,
+  getDrainItemAgentMetadata,
+  getDrainItemCwd,
+  getDrainItemPromptNumber,
+} from './llm/SmartLlmDrainPromptBuilder.js';
+import { recordSmartLlmDrainMetrics } from './llm/SmartLlmDrainMetricsRegistry.js';
 
 const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
+
+interface ObservationSplitProgress {
+  storedParts: number;
+}
 
 /**
  * Parse Retry-After header (seconds or HTTP-date). Returns ms or undefined.
@@ -62,6 +77,13 @@ export function classifyOpenRouterError(input: {
     return new ClassifiedProviderError(
       `OpenRouter quota exhausted${status !== undefined ? ` (status ${status})` : ''}`,
       { kind: 'quota_exhausted', cause: input.cause },
+    );
+  }
+
+  if (isContextOverflowMessage(body)) {
+    return new ClassifiedProviderError(
+      `OpenRouter context overflow${status !== undefined ? ` (status ${status})` : ''}`,
+      { kind: 'context_overflow', cause: input.cause },
     );
   }
 
@@ -180,10 +202,19 @@ export class OpenRouterProvider {
     }
 
     let lastCwd: string | undefined;
+    const drainOptions = parseSmartLlmDrainOptions(SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH));
+    const drain = new SmartLlmDrain(drainOptions, {
+      getQueueDepth: () => this.sessionManager.getTotalQueueDepth(),
+      onMetrics: metrics => recordSmartLlmDrainMetrics('OpenRouter', metrics),
+    });
+    const splitter = new SmartLlmContextSplitter(drainOptions.contextSplit);
 
     try {
-      for await (const message of this.sessionManager.getMessageIterator(session.sessionDbId)) {
-        lastCwd = await this.processOneMessage(session, message, lastCwd, apiKey, model, siteUrl, appName, worker, mode);
+      for await (const item of drain.drain(
+        this.sessionManager.getMessageIterator(session.sessionDbId),
+        session.abortController.signal
+      )) {
+        lastCwd = await this.processOneDrainItem(session, item, lastCwd, apiKey, model, siteUrl, appName, worker, mode, drain, splitter, drainOptions);
       }
     } catch (error: unknown) {
       if (error instanceof Error) {
@@ -204,9 +235,10 @@ export class OpenRouterProvider {
     });
   }
 
-  private prepareMessageMetadata(session: ActiveSession, message: { agentId?: string | null; agentType?: string | null }): void {
-    session.pendingAgentId = message.agentId ?? null;
-    session.pendingAgentType = message.agentType ?? null;
+  private prepareDrainItemMetadata(session: ActiveSession, item: DrainItem): void {
+    const metadata = getDrainItemAgentMetadata(item);
+    session.pendingAgentId = metadata.agentId;
+    session.pendingAgentType = metadata.agentType;
   }
 
   private async handleInitResponse(
@@ -216,7 +248,6 @@ export class OpenRouterProvider {
     model: string
   ): Promise<void> {
     if (initResponse.content) {
-      session.conversationHistory.push({ role: 'assistant', content: initResponse.content });
       const tokensUsed = initResponse.tokensUsed || 0;
       session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);
       session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
@@ -232,42 +263,153 @@ export class OpenRouterProvider {
     }
   }
 
-  private async processOneMessage(
+  private async processOneDrainItem(
     session: ActiveSession,
-    message: { _persistentId: number; agentId?: string | null; agentType?: string | null; type: 'observation' | 'summarize'; cwd?: string; prompt_number?: number; tool_name?: string; tool_input?: unknown; tool_response?: unknown; last_assistant_message?: string },
+    item: DrainItem,
     lastCwd: string | undefined,
     apiKey: string,
     model: string,
     siteUrl: string | undefined,
     appName: string | undefined,
     worker: WorkerRef | undefined,
-    mode: ModeConfig
+    mode: ModeConfig,
+    drain: SmartLlmDrain,
+    splitter: SmartLlmContextSplitter,
+    drainOptions: SmartLlmDrainOptions
   ): Promise<string | undefined> {
-    this.prepareMessageMetadata(session, message);
+    this.prepareDrainItemMetadata(session, item);
 
-    if (message.cwd) {
-      lastCwd = message.cwd;
+    const itemCwd = getDrainItemCwd(item);
+    if (itemCwd) {
+      lastCwd = itemCwd;
     }
     const originalTimestamp = session.earliestPendingTimestamp;
 
-    if (message.type === 'observation') {
-      await this.processObservationMessage(
-        session, message, originalTimestamp, lastCwd,
-        apiKey, model, siteUrl, appName, worker, mode
-      );
-    } else if (message.type === 'summarize') {
+    if (item.kind === 'single' && item.message.type === 'summarize') {
       await this.processSummaryMessage(
-        session, message, originalTimestamp, lastCwd,
-        apiKey, model, siteUrl, appName, worker, mode
+        session, item.message, originalTimestamp, lastCwd,
+        apiKey, model, siteUrl, appName, worker, mode, drain
       );
+    } else {
+      const parts = splitter.split(item);
+      this.logSplitParts(session.sessionDbId, item, parts);
+      const progress: ObservationSplitProgress = { storedParts: 0 };
+      try {
+        lastCwd = await this.processObservationParts(
+          session, parts, originalTimestamp, lastCwd,
+          apiKey, model, siteUrl, appName, worker, drain, progress
+        );
+      } catch (error) {
+        if (this.shouldHardStopPartialSplitContextOverflow(error, session, item, progress, model)) {
+          throw error;
+        }
+        const retryPlan = buildContextOverflowRetryPlan(error, item, parts, drainOptions.contextSplit);
+        if (!retryPlan) {
+          if (await this.retryOrFailContextOverflowItem(error, session, item, drainOptions)) {
+            return lastCwd;
+          }
+          throw error;
+        }
+        logger.warn('QUEUE', 'Context overflow retry with smaller split budget', {
+          sessionDbId: session.sessionDbId,
+          provider: 'OpenRouter',
+          model,
+          sourceIds: item.sourceIds,
+          previousMaxChars: drainOptions.contextSplit.maxChars,
+          retryMaxChars: retryPlan.options.maxChars,
+          retryMaxParts: retryPlan.options.maxParts,
+          retrySplitTotal: retryPlan.parts.length,
+        });
+        const retryProgress: ObservationSplitProgress = { storedParts: 0 };
+        try {
+          lastCwd = await this.processObservationParts(
+            session, retryPlan.parts, originalTimestamp, lastCwd,
+            apiKey, model, siteUrl, appName, worker, drain, retryProgress
+          );
+        } catch (retryError) {
+          if (this.shouldHardStopPartialSplitContextOverflow(retryError, session, item, retryProgress, model)) {
+            throw retryError;
+          }
+          if (await this.retryOrFailContextOverflowItem(retryError, session, item, drainOptions)) {
+            return lastCwd;
+          }
+          throw retryError;
+        }
+      }
     }
 
     return lastCwd;
   }
 
-  private async processObservationMessage(
+  private async retryOrFailContextOverflowItem(
+    error: unknown,
     session: ActiveSession,
-    message: { prompt_number?: number; tool_name?: string; tool_input?: unknown; tool_response?: unknown; cwd?: string },
+    item: DrainItem,
+    drainOptions: SmartLlmDrainOptions
+  ): Promise<boolean> {
+    if (!isProviderContextOverflowError(error)) {
+      return false;
+    }
+
+    const retryDelayMs = Math.max(250, drainOptions.minSendIntervalMs);
+    const result = await this.sessionManager.retryOrFailClaimedMessageIds(
+      session.sessionDbId,
+      item.sourceIds,
+      'context_overflow',
+      drainOptions.maxAttempts,
+      Date.now() + retryDelayMs
+    );
+    session.activeSplitPart = null;
+    session.splitGroupProgress = null;
+    logger.warn('QUEUE', 'Message retry/dead-letter decision after provider context overflow', {
+      sessionDbId: session.sessionDbId,
+      provider: 'OpenRouter',
+      sourceIds: item.sourceIds,
+      retried: result.retried,
+      failed: result.failed,
+      maxAttempts: drainOptions.maxAttempts,
+    });
+    return true;
+  }
+
+  private shouldHardStopPartialSplitContextOverflow(
+    error: unknown,
+    session: ActiveSession,
+    item: DrainItem,
+    progress: ObservationSplitProgress,
+    model: string
+  ): boolean {
+    if (progress.storedParts <= 0 || !isProviderContextOverflowError(error)) {
+      return false;
+    }
+
+    session.activeSplitPart = null;
+    session.splitGroupProgress = null;
+    logger.error('QUEUE', 'Context overflow after partial split storage; hard-stopping session to avoid duplicate retry', {
+      sessionDbId: session.sessionDbId,
+      provider: 'OpenRouter',
+      model,
+      sourceIds: item.sourceIds,
+      storedSplitParts: progress.storedParts,
+      reason: 'partial_split_context_overflow',
+    });
+    return true;
+  }
+
+  private logSplitParts(sessionDbId: number, item: DrainItem, parts: DrainItem[]): void {
+    if (parts.length > 1) {
+      logger.info('QUEUE', 'Split observation drain item for provider sends', {
+        sessionDbId,
+        splitGroupId: parts[0].splitMetadata?.splitGroupId,
+        splitTotal: parts.length,
+        originalSourceIds: item.sourceIds,
+      });
+    }
+  }
+
+  private async processObservationParts(
+    session: ActiveSession,
+    parts: DrainItem[],
     originalTimestamp: number | null,
     lastCwd: string | undefined,
     apiKey: string,
@@ -275,40 +417,110 @@ export class OpenRouterProvider {
     siteUrl: string | undefined,
     appName: string | undefined,
     worker: WorkerRef | undefined,
-    _mode: ModeConfig
-  ): Promise<void> {
-    if (message.prompt_number !== undefined) {
-      session.lastPromptNumber = message.prompt_number;
+    drain: SmartLlmDrain,
+    progress: ObservationSplitProgress = { storedParts: 0 }
+  ): Promise<string | undefined> {
+    let totalLatencyMs = 0;
+    let recordedFailure = false;
+    for (const part of parts) {
+      this.prepareDrainItemMetadata(session, part);
+      const partCwd = getDrainItemCwd(part);
+      if (partCwd) {
+        lastCwd = partCwd;
+      }
+      const result = await this.processObservationMessage(
+        session, part, originalTimestamp, lastCwd,
+        apiKey, model, siteUrl, appName, worker, drain, parts.length === 1
+      );
+      totalLatencyMs += result.latencyMs;
+      if (result.kind === 'stored') {
+        progress.storedParts++;
+      }
+      if (parts.length > 1 && result.kind === 'invalid') {
+        if (result.empty) {
+          drain.recordProviderEmptyResponse('empty_split_observation_response');
+        } else {
+          drain.recordParserFailure('invalid_split_observation_response');
+        }
+        recordedFailure = true;
+        break;
+      }
+    }
+
+    if (parts.length > 1 && !recordedFailure) {
+      drain.recordProviderSuccess(totalLatencyMs);
+    }
+    return lastCwd;
+  }
+
+  private async processObservationMessage(
+    session: ActiveSession,
+    item: DrainItem,
+    originalTimestamp: number | null,
+    lastCwd: string | undefined,
+    apiKey: string,
+    model: string,
+    siteUrl: string | undefined,
+    appName: string | undefined,
+    worker: WorkerRef | undefined,
+    drain: SmartLlmDrain,
+    recordDrainMetrics = true
+  ): Promise<{ kind: 'stored' | 'invalid' | 'deferred'; empty: boolean; latencyMs: number }> {
+    const promptNumber = getDrainItemPromptNumber(item);
+    if (promptNumber !== undefined) {
+      session.lastPromptNumber = promptNumber;
     }
 
     if (!session.memorySessionId) {
       throw new Error('Cannot process observations: memorySessionId not yet captured. This session may need to be reinitialized.');
     }
 
-    const obsPrompt = buildObservationPrompt({
-      id: 0,
-      tool_name: message.tool_name!,
-      tool_input: JSON.stringify(message.tool_input),
-      tool_output: JSON.stringify(message.tool_response),
-      created_at_epoch: originalTimestamp ?? Date.now(),
-      cwd: message.cwd
-    });
+    if (item.kind !== 'single') {
+      logger.info('QUEUE', item.kind === 'coalesced' ? 'Coalesced observations' : 'Batched observations', {
+        sessionDbId: session.sessionDbId,
+        sourceIds: item.sourceIds,
+        count: item.sourceIds.length,
+      });
+    }
+
+    const obsPrompt = buildObservationPromptFromDrainItem(item, originalTimestamp ?? Date.now());
 
     session.conversationHistory.push({ role: 'user', content: obsPrompt });
-    const obsResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, siteUrl, appName);
+    const queryStartedAt = Date.now();
+    let obsResponse: { content: string; tokensUsed?: number };
+    try {
+      obsResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, siteUrl, appName);
+    } catch (error) {
+      const lastMessage = session.conversationHistory[session.conversationHistory.length - 1];
+      if (lastMessage?.role === 'user' && lastMessage.content === obsPrompt) {
+        session.conversationHistory.pop();
+      }
+      throw error;
+    }
+    const latencyMs = Date.now() - queryStartedAt;
 
     let tokensUsed = 0;
     if (obsResponse.content) {
-      session.conversationHistory.push({ role: 'assistant', content: obsResponse.content });
       tokensUsed = obsResponse.tokensUsed || 0;
       session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);
       session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
     }
 
-    await processAgentResponse(
+    const outcome = await processAgentResponse(
       obsResponse.content || '', session, this.dbManager, this.sessionManager,
-      worker, tokensUsed, originalTimestamp, 'OpenRouter', lastCwd, model
+      worker, tokensUsed, originalTimestamp, 'OpenRouter', lastCwd, model,
+      item.splitMetadata ? { splitPart: item.splitMetadata } : undefined
     );
+    if (recordDrainMetrics) {
+      if (!obsResponse.content) {
+        drain.recordProviderEmptyResponse('empty_observation_response');
+      } else if (outcome.kind === 'invalid') {
+        drain.recordParserFailure('invalid_observation_response');
+      } else {
+        drain.recordProviderSuccess(latencyMs);
+      }
+    }
+    return { kind: outcome.kind, empty: !obsResponse.content, latencyMs };
   }
 
   private async processSummaryMessage(
@@ -321,7 +533,8 @@ export class OpenRouterProvider {
     siteUrl: string | undefined,
     appName: string | undefined,
     worker: WorkerRef | undefined,
-    mode: ModeConfig
+    mode: ModeConfig,
+    drain: SmartLlmDrain
   ): Promise<void> {
     if (!session.memorySessionId) {
       throw new Error('Cannot process summary: memorySessionId not yet captured. This session may need to be reinitialized.');
@@ -336,20 +549,37 @@ export class OpenRouterProvider {
     }, mode);
 
     session.conversationHistory.push({ role: 'user', content: summaryPrompt });
-    const summaryResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, siteUrl, appName);
+    const queryStartedAt = Date.now();
+    let summaryResponse: { content: string; tokensUsed?: number };
+    try {
+      summaryResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, siteUrl, appName);
+    } catch (error) {
+      const lastMessage = session.conversationHistory[session.conversationHistory.length - 1];
+      if (lastMessage?.role === 'user' && lastMessage.content === summaryPrompt) {
+        session.conversationHistory.pop();
+      }
+      throw error;
+    }
+    const latencyMs = Date.now() - queryStartedAt;
 
     let tokensUsed = 0;
     if (summaryResponse.content) {
-      session.conversationHistory.push({ role: 'assistant', content: summaryResponse.content });
       tokensUsed = summaryResponse.tokensUsed || 0;
       session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);
       session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
     }
 
-    await processAgentResponse(
+    const outcome = await processAgentResponse(
       summaryResponse.content || '', session, this.dbManager, this.sessionManager,
       worker, tokensUsed, originalTimestamp, 'OpenRouter', lastCwd, model
     );
+    if (!summaryResponse.content) {
+      drain.recordProviderEmptyResponse('empty_summary_response');
+    } else if (outcome.kind === 'invalid') {
+      drain.recordParserFailure('invalid_summary_response');
+    } else {
+      drain.recordProviderSuccess(latencyMs);
+    }
   }
 
   private async handleSessionError(error: unknown, session: ActiveSession, _worker?: WorkerRef): Promise<never> {

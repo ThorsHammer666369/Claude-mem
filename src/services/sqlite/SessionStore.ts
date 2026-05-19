@@ -6,7 +6,6 @@ import {
   IndexInfo,
   TableNameRow,
   SchemaVersion,
-  SdkSessionRecord,
   ObservationRecord,
   SessionSummaryRecord,
   UserPromptRecord,
@@ -71,6 +70,7 @@ export class SessionStore {
     this.dropDeadPendingMessagesColumns();
     this.ensurePendingMessagesToolUseIdColumn();
     this.dropWorkerPidColumn();
+    this.ensurePendingMessageQueueMetadata();
   }
 
   private dropWorkerPidColumn(): void {
@@ -963,6 +963,69 @@ export class SessionStore {
       this.db.run('ROLLBACK');
       throw error;
     }
+  }
+
+  private ensurePendingMessageQueueMetadata(): void {
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(35) as SchemaVersion | undefined;
+
+    const tables = this.db.query(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='pending_messages'"
+    ).all() as TableNameRow[];
+    if (tables.length === 0) {
+      this.createPendingMessageDeadLettersTable();
+      if (!applied) {
+        this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(35, new Date().toISOString());
+      }
+      return;
+    }
+
+    const cols = this.db.query('PRAGMA table_info(pending_messages)').all() as TableColumnInfo[];
+    const colNames = new Set(cols.map(c => c.name));
+
+    if (!colNames.has('attempt_count')) {
+      this.db.run('ALTER TABLE pending_messages ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!colNames.has('last_error')) {
+      this.db.run('ALTER TABLE pending_messages ADD COLUMN last_error TEXT');
+    }
+    if (!colNames.has('available_at_epoch_ms')) {
+      this.db.run('ALTER TABLE pending_messages ADD COLUMN available_at_epoch_ms INTEGER');
+    }
+    if (!colNames.has('status_reason')) {
+      this.db.run('ALTER TABLE pending_messages ADD COLUMN status_reason TEXT');
+    }
+    if (!colNames.has('priority')) {
+      this.db.run('ALTER TABLE pending_messages ADD COLUMN priority INTEGER NOT NULL DEFAULT 50');
+    }
+    if (!colNames.has('size_chars')) {
+      this.db.run('ALTER TABLE pending_messages ADD COLUMN size_chars INTEGER NOT NULL DEFAULT 0');
+    }
+
+    this.createPendingMessageDeadLettersTable();
+
+    if (!applied) {
+      this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(35, new Date().toISOString());
+    }
+  }
+
+  private createPendingMessageDeadLettersTable(): void {
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS pending_message_dead_letters (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        original_message_id INTEGER NOT NULL,
+        session_db_id INTEGER NOT NULL,
+        content_session_id TEXT NOT NULL,
+        message_type TEXT NOT NULL,
+        tool_name TEXT,
+        source_payload TEXT NOT NULL,
+        attempt_count INTEGER NOT NULL,
+        status_reason TEXT NOT NULL,
+        last_error TEXT,
+        failed_at_epoch_ms INTEGER NOT NULL
+      )
+    `);
+    this.db.run('CREATE INDEX IF NOT EXISTS idx_pending_dead_letters_session ON pending_message_dead_letters(session_db_id)');
+    this.db.run('CREATE INDEX IF NOT EXISTS idx_pending_dead_letters_failed ON pending_message_dead_letters(failed_at_epoch_ms DESC)');
   }
 
   private addObservationsUniqueContentHashIndex(): void {

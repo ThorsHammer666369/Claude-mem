@@ -85,6 +85,7 @@ describe('ResponseProcessor', () => {
         resetStuckMessages: mock(() => 0),
       }),
       confirmClaimedMessages: mock(() => Promise.resolve(0)),
+      retryOrFailClaimedMessages: mock(() => Promise.resolve({ retried: 0, failed: 0 })),
       resetProcessingToPending: mock(() => Promise.resolve(0)),
     } as unknown as SessionManager;
 
@@ -207,12 +208,12 @@ describe('ResponseProcessor', () => {
   });
 
   describe('non-XML observer responses', () => {
-    it('warns and clears pending work when the observer returns non-XML prose', async () => {
-      const confirmClaimedMessages = mock(() => Promise.resolve(0));
+    it('warns and retries pending work when the observer returns non-XML prose', async () => {
+      const retryOrFailClaimedMessages = mock(() => Promise.resolve({ retried: 1, failed: 0 }));
       mockSessionManager = {
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
-        confirmClaimedMessages,
+        retryOrFailClaimedMessages,
       } as unknown as SessionManager;
 
       const session = createMockSession();
@@ -234,7 +235,12 @@ describe('ResponseProcessor', () => {
         expect.stringMatching(/^TestAgent returned non-XML\/empty response/),
         expect.objectContaining({ sessionId: 1 })
       );
-      expect(confirmClaimedMessages).toHaveBeenCalledWith(1);
+      expect(retryOrFailClaimedMessages).toHaveBeenCalledWith(
+        1,
+        'invalid_or_empty_response',
+        3,
+        expect.any(Number)
+      );
       expect(session.earliestPendingTimestamp).toBeNull();
       expect(mockStoreObservations).not.toHaveBeenCalled();
     });
@@ -458,12 +464,12 @@ describe('ResponseProcessor', () => {
   });
 
   describe('handling empty / non-XML response', () => {
-    it('clears pending work and does NOT call storeObservations on empty response', async () => {
-      const confirmClaimedMessages = mock(() => Promise.resolve(0));
+    it('retries pending work and does NOT call storeObservations on empty response', async () => {
+      const retryOrFailClaimedMessages = mock(() => Promise.resolve({ retried: 1, failed: 0 }));
       mockSessionManager = {
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
-        confirmClaimedMessages,
+        retryOrFailClaimedMessages,
       } as unknown as SessionManager;
 
       const session = createMockSession();
@@ -475,16 +481,21 @@ describe('ResponseProcessor', () => {
       );
 
       expect(mockStoreObservations).not.toHaveBeenCalled();
-      expect(confirmClaimedMessages).toHaveBeenCalledWith(1);
+      expect(retryOrFailClaimedMessages).toHaveBeenCalledWith(
+        1,
+        'invalid_or_empty_response',
+        3,
+        expect.any(Number)
+      );
       expect(session.earliestPendingTimestamp).toBeNull();
     });
 
-    it('clears pending work and does NOT call storeObservations on plain-text response', async () => {
-      const confirmClaimedMessages = mock(() => Promise.resolve(0));
+    it('retries pending work and does NOT call storeObservations on plain-text response', async () => {
+      const retryOrFailClaimedMessages = mock(() => Promise.resolve({ retried: 1, failed: 0 }));
       mockSessionManager = {
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
-        confirmClaimedMessages,
+        retryOrFailClaimedMessages,
       } as unknown as SessionManager;
 
       const session = createMockSession();
@@ -496,8 +507,195 @@ describe('ResponseProcessor', () => {
       );
 
       expect(mockStoreObservations).not.toHaveBeenCalled();
-      expect(confirmClaimedMessages).toHaveBeenCalledWith(1);
+      expect(retryOrFailClaimedMessages).toHaveBeenCalledWith(
+        1,
+        'invalid_or_empty_response',
+        3,
+        expect.any(Number)
+      );
       expect(session.earliestPendingTimestamp).toBeNull();
+    });
+  });
+
+  describe('split drain claim handling', () => {
+    const splitPart = (splitIndex: number, splitTotal = 2) => ({
+      splitGroupId: 'context-11-single-observation',
+      splitIndex,
+      splitTotal,
+      originalSourceIds: [11],
+      parentMessageType: 'observation',
+      reason: 'context_limit' as const,
+    });
+
+    const validObservation = (title: string) => `
+      <observation>
+        <type>discovery</type>
+        <title>${title}</title>
+        <narrative>${title} narrative</narrative>
+        <facts></facts>
+        <concepts></concepts>
+        <files_read></files_read>
+        <files_modified></files_modified>
+      </observation>
+    `;
+
+    it('defers claimed message confirmation for a non-final split part', async () => {
+      const confirmClaimedMessages = mock(() => Promise.resolve(1));
+      mockSessionManager = {
+        ...mockSessionManager,
+        confirmClaimedMessages,
+      } as unknown as SessionManager;
+      const session = createMockSession({
+        claimedMessageIds: [11],
+      });
+
+      const outcome = await processAgentResponse(
+        validObservation('split part one'),
+        session,
+        mockDbManager,
+        mockSessionManager,
+        mockWorker,
+        100,
+        1700000000000,
+        'TestAgent',
+        undefined,
+        undefined,
+        { splitPart: splitPart(1) }
+      );
+
+      expect(outcome.kind).toBe('stored');
+      expect(mockStoreObservations).toHaveBeenCalledTimes(1);
+      expect(confirmClaimedMessages).not.toHaveBeenCalled();
+      expect(session.earliestPendingTimestamp).not.toBeNull();
+    });
+
+    it('confirms claimed messages only after the final split part succeeds', async () => {
+      const confirmClaimedMessages = mock(() => Promise.resolve(1));
+      const confirmClaimedMessageIds = mock(() => Promise.resolve(1));
+      mockSessionManager = {
+        ...mockSessionManager,
+        confirmClaimedMessages,
+        confirmClaimedMessageIds,
+      } as unknown as SessionManager;
+      const session = createMockSession({
+        claimedMessageIds: [11, 99],
+      });
+
+      await processAgentResponse(
+        validObservation('split part one'),
+        session,
+        mockDbManager,
+        mockSessionManager,
+        mockWorker,
+        100,
+        1700000000000,
+        'TestAgent',
+        undefined,
+        undefined,
+        { splitPart: splitPart(1) }
+      );
+      await processAgentResponse(
+        validObservation('split part two'),
+        session,
+        mockDbManager,
+        mockSessionManager,
+        mockWorker,
+        100,
+        1700000000000,
+        'TestAgent',
+        undefined,
+        undefined,
+        { splitPart: splitPart(2) }
+      );
+
+      expect(mockStoreObservations).toHaveBeenCalledTimes(2);
+      expect(confirmClaimedMessages).not.toHaveBeenCalled();
+      expect(confirmClaimedMessageIds).toHaveBeenCalledTimes(1);
+      expect(confirmClaimedMessageIds).toHaveBeenCalledWith(1, [11]);
+    });
+
+    it('retries claimed message ids when the first split part is invalid before anything stores', async () => {
+      const retryOrFailClaimedMessages = mock(() => Promise.resolve({ retried: 1, failed: 0 }));
+      const retryOrFailClaimedMessageIds = mock(() => Promise.resolve({ retried: 1, failed: 0 }));
+      mockSessionManager = {
+        ...mockSessionManager,
+        retryOrFailClaimedMessages,
+        retryOrFailClaimedMessageIds,
+      } as unknown as SessionManager;
+      const session = createMockSession({
+        claimedMessageIds: [11, 99],
+      });
+
+      const outcome = await processAgentResponse(
+        '',
+        session,
+        mockDbManager,
+        mockSessionManager,
+        mockWorker,
+        100,
+        1700000000000,
+        'TestAgent',
+        undefined,
+        undefined,
+        { splitPart: splitPart(1) }
+      );
+
+      expect(outcome.kind).toBe('invalid');
+      expect(retryOrFailClaimedMessages).not.toHaveBeenCalled();
+      expect(retryOrFailClaimedMessageIds).toHaveBeenCalledWith(
+        1,
+        [11],
+        'invalid_or_empty_response',
+        3,
+        expect.any(Number)
+      );
+    });
+
+    it('hard-stops without retrying original ids when a later split part is invalid after storage', async () => {
+      const confirmClaimedMessages = mock(() => Promise.resolve(1));
+      const retryOrFailClaimedMessages = mock(() => Promise.resolve({ retried: 1, failed: 0 }));
+      const retryOrFailClaimedMessageIds = mock(() => Promise.resolve({ retried: 1, failed: 0 }));
+      mockSessionManager = {
+        ...mockSessionManager,
+        confirmClaimedMessages,
+        retryOrFailClaimedMessages,
+        retryOrFailClaimedMessageIds,
+      } as unknown as SessionManager;
+      const session = createMockSession({
+        claimedMessageIds: [11, 99],
+      });
+
+      await processAgentResponse(
+        validObservation('split part one'),
+        session,
+        mockDbManager,
+        mockSessionManager,
+        mockWorker,
+        100,
+        1700000000000,
+        'TestAgent',
+        undefined,
+          undefined,
+          { splitPart: splitPart(1) }
+        );
+      await expect(processAgentResponse(
+        '',
+        session,
+        mockDbManager,
+        mockSessionManager,
+        mockWorker,
+        100,
+        1700000000000,
+        'TestAgent',
+        undefined,
+        undefined,
+        { splitPart: splitPart(2) }
+      )).rejects.toThrow(/partial split/i);
+
+      expect(confirmClaimedMessages).not.toHaveBeenCalled();
+      expect(retryOrFailClaimedMessages).not.toHaveBeenCalled();
+      expect(retryOrFailClaimedMessageIds).not.toHaveBeenCalled();
+      expect(session.splitGroupProgress).toBeNull();
     });
   });
 
@@ -622,6 +820,30 @@ describe('ResponseProcessor', () => {
       expect(session.conversationHistory).toHaveLength(1);
       expect(session.conversationHistory[0].role).toBe('assistant');
       expect(session.conversationHistory[0].content).toBe(responseText);
+    });
+
+    it('does not add invalid provider output to conversation history', async () => {
+      const retryOrFailClaimedMessages = mock(() => Promise.resolve({ retried: 1, failed: 0 }));
+      mockSessionManager = {
+        ...mockSessionManager,
+        retryOrFailClaimedMessages,
+      } as unknown as SessionManager;
+      const session = createMockSession({
+        conversationHistory: [],
+      });
+
+      await processAgentResponse(
+        'plain text that the parser will reject',
+        session,
+        mockDbManager,
+        mockSessionManager,
+        mockWorker,
+        100,
+        null,
+        'TestAgent'
+      );
+
+      expect(session.conversationHistory).toHaveLength(0);
     });
   });
 

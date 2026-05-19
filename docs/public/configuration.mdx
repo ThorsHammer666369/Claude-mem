@@ -45,6 +45,37 @@ See [Gemini Provider](usage/gemini-provider) for detailed configuration and free
 
 See [OpenRouter Provider](usage/openrouter-provider) for detailed configuration, free model list, and usage guide.
 
+### Local LLM Queue Settings
+
+Use these when a local or slow provider needs worker-side pacing instead of faster hook ingestion:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `CLAUDE_MEM_MAX_CONCURRENT_AGENTS` | `2` | Maximum worker agent sessions running at once |
+| `CLAUDE_MEM_LLM_QUEUE_MODE` | `auto` | `off`, `auto`, or `local_safe` drain behavior |
+| `CLAUDE_MEM_LLM_MIN_SEND_INTERVAL_MS` | `0` | Minimum provider send delay |
+| `CLAUDE_MEM_LLM_BATCH_MAX_ITEMS` | `3` | Maximum compatible low-value observations per batch |
+| `CLAUDE_MEM_LLM_BATCH_MAX_CHARS` | `24000` | Prompt character budget per drained item |
+| `CLAUDE_MEM_LLM_COALESCE_WINDOW_MS` | `5000` | Time window for coalescing repeated low-value observations |
+| `CLAUDE_MEM_LLM_ADAPTIVE_BACKOFF` | `true` | Increase delay after empty, timeout, or parser failures |
+| `CLAUDE_MEM_LLM_MAX_ATTEMPTS` | `3` | Retry cap before dead-lettering a bad queued row |
+| `CLAUDE_MEM_LLM_CONTEXT_SPLIT_ENABLED` | `true` | Split oversized queued prompts before provider send |
+| `CLAUDE_MEM_LLM_CONTEXT_MAX_CHARS` | `50000` | Default pre-send context budget for one provider request |
+| `CLAUDE_MEM_LLM_CONTEXT_SPLIT_MAX_PARTS` | `20` | Maximum split parts for one oversized drain item |
+| `CLAUDE_MEM_QUEUE_HIGH_WATERMARK` | `200` | Queue depth where pressure behavior starts |
+| `CLAUDE_MEM_QUEUE_CRITICAL_WATERMARK` | `1000` | Queue depth reported as critical |
+| `CLAUDE_MEM_QUEUE_DROP_POLICY` | `coalesce_low_value` | Policy label exposed in queue status |
+| `CLAUDE_MEM_QUEUE_METRICS_ENABLED` | `true` | Enables queue/provider pressure metrics |
+
+Small local models should usually set `CLAUDE_MEM_MAX_CONCURRENT_AGENTS=1`,
+`CLAUDE_MEM_LLM_QUEUE_MODE=local_safe`, and
+`CLAUDE_MEM_LLM_MIN_SEND_INTERVAL_MS=1500`.
+
+Queue pressure is visible at `GET /api/queue/status`.
+
+These settings are also available in the web viewer settings modal under the
+Advanced tab's **LLM Queue & Timing** section.
+
 ### Claude Gateway Settings
 
 Gateway credentials live in `~/.claude-mem/.env`, not `settings.json`.

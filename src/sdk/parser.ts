@@ -35,53 +35,57 @@ export interface ParsedSummary {
 }
 
 export type ParseResult =
-  | { valid: true; observations: ParsedObservation[]; summary: ParsedSummary | null }
-  | { valid: false };
+  | { valid: true; kind: 'observation'; data: ParsedObservation[]; observations: ParsedObservation[]; summary: null }
+  | { valid: true; kind: 'summary'; data: ParsedSummary; observations: []; summary: ParsedSummary }
+  | { valid: false; reason: string };
 
 export function parseAgentXml(raw: string, correlationId?: string | number): ParseResult {
   if (typeof raw !== 'string' || !raw.trim()) {
-    return { valid: false };
+    return { valid: false, reason: 'empty response' };
   }
 
   raw = stripCodeFences(raw);
 
   const skipMatch = /<skip_summary(?:\s+reason="([^"]*)")?\s*\/>/.exec(raw);
   if (skipMatch) {
+    const summary: ParsedSummary = {
+      request: null,
+      investigated: null,
+      learned: null,
+      completed: null,
+      next_steps: null,
+      notes: null,
+      skipped: true,
+      skip_reason: skipMatch[1] ?? null,
+    };
     return {
       valid: true,
+      kind: 'summary',
+      data: summary,
       observations: [],
-      summary: {
-        request: null,
-        investigated: null,
-        learned: null,
-        completed: null,
-        next_steps: null,
-        notes: null,
-        skipped: true,
-        skip_reason: skipMatch[1] ?? null,
-      },
+      summary,
     };
   }
 
   const firstRoot = /<(observation|summary)\b/i.exec(raw);
   if (!firstRoot) {
-    return { valid: false };
+    return { valid: false, reason: 'unknown root' };
   }
 
   const rootName = firstRoot[1].toLowerCase();
   if (rootName === 'observation') {
     const observations = parseObservationBlocks(raw, correlationId);
     if (observations.length === 0) {
-      return { valid: false };
+      return { valid: false, reason: 'empty observation' };
     }
-    return { valid: true, observations, summary: null };
+    return { valid: true, kind: 'observation', data: observations, observations, summary: null };
   }
 
   const summary = parseSummaryBlock(raw, correlationId);
   if (!summary) {
-    return { valid: false };
+    return { valid: false, reason: 'empty summary' };
   }
-  return { valid: true, observations: [], summary };
+  return { valid: true, kind: 'summary', data: summary, observations: [], summary };
 }
 
 function parseObservationBlocks(text: string, correlationId?: string | number): ParsedObservation[] {

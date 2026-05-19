@@ -74,7 +74,13 @@ export class SessionQueueProcessor {
     return {
       ...pending,
       _persistentId: msg.id,
-      _originalTimestamp: msg.created_at_epoch
+      _originalTimestamp: msg.created_at_epoch,
+      attemptCount: msg.attempt_count,
+      lastError: msg.last_error,
+      availableAtEpochMs: msg.available_at_epoch_ms,
+      statusReason: msg.status_reason,
+      priority: msg.priority,
+      sizeChars: msg.size_chars
     };
   }
 

@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Added
+
+- Add configurable local LLM context split settings: `CLAUDE_MEM_LLM_CONTEXT_SPLIT_ENABLED`, `CLAUDE_MEM_LLM_CONTEXT_MAX_CHARS`, and `CLAUDE_MEM_LLM_CONTEXT_SPLIT_MAX_PARTS`.
+- Add worker settings parsing and `/api/settings` validation for context split limits, including malformed numeric string rejection.
+- Add `SmartLlmContextSplitter` for oversized queued drain items, including source-ID-preserving split metadata and conservative fallback behavior when splitting would lose data.
+- Wire context splitting into Claude, Gemini, and OpenRouter provider drain loops before observation sends.
+- Add split-aware response processing that defers queue confirmation until every split part succeeds.
+- Add provider context-overflow classification and a one-shot smaller split-budget retry before queue retry/dead-letter handling.
+- Add partial split overflow protection so direct providers hard-stop instead of retrying original queue IDs after some split parts have already stored observations.
+- Add partial split invalid-output protection so split retries do not duplicate already stored observations after a later split part returns empty or non-XML output.
+- Add summary provider failure cleanup so failed Gemini/OpenRouter summary sends do not leave stale summary prompts in conversation history.
+- Make `processAgentResponse()` the single owner for assistant history appends and keep invalid provider output out of conversation history.
+- Add source-ID-scoped queue confirm/retry helpers so buffered lookahead claims are not affected by split-group success or failure.
+- Add delayed retry wakeups for SQLite queue retries and delayed-job scheduling for BullMQ retries.
+- Add a viewer Advanced tab "LLM Queue & Timing" section for concurrency, queue mode, pacing, batching, retry, watermark, metrics, and context split controls.
+- Add `/api/settings` allow-list and validation coverage for the local LLM queue/timing fields surfaced in the viewer.
+- Restore additive `parseAgentXml()` compatibility fields (`kind`, `data`, and invalid `reason`) while preserving the newer `observations`/`summary` payload shape.
+- Fix Windows path conversion in source-reading tests by using `fileURLToPath()` instead of URL pathname strings.
+
+### Fixed
+
+- Fix root and viewer typecheck drift found during local LLM branch verification, including Express 5 route parameter coercion, OpenClaw/Cursor integration types, Clack spinner calls, logger component typing, and nullable React refs/timeouts.
+- Refresh stale OpenClaw lifecycle tests so `session_start` and `after_compaction` assert tracking-only behavior while `before_agent_start` remains the worker session-init boundary.
+- Refresh summarize-handler mocks for the current worker fallback/server-beta import graph and settings shape.
+- Make the v12.4.3 cleanup test teardown Windows-safe around Bun SQLite handle release.
+- Normalize logger-standards test paths before matching exclusion patterns on Windows; the broader logger policy gate still needs separate scope cleanup.
+
 ## [13.2.0] - 2026-05-12
 
 ## What's new

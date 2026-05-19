@@ -68,14 +68,15 @@ Stop -> summarize -> /api/sessions/summarize
 
 ```text
 enqueue()                    -> INSERT row with `pending` status
-clearPendingForSession()     -> DELETE all pending rows for session
-                                (called whenever the parser returns
-                                a parseable response, regardless of
-                                whether observations were extracted)
+confirmClaimedMessages()     -> DELETE only rows claimed by the current
+                                provider response after valid XML is stored
+retryOrFailClaimedMessages() -> retry invalid/empty provider output up to
+                                CLAUDE_MEM_LLM_MAX_ATTEMPTS, then dead-letter
 ```
 
 Parser is binary: `{ valid: true, observations, summary }` or `{ valid: false }`.
-Unparseable responses leave the queue untouched and the session iterator continues.
+Unparseable responses no longer confirm queue rows as processed. They are
+scheduled for bounded retry and eventually copied to `pending_message_dead_letters`.
 
 ### Generator restart loop (SessionRoutes)
 

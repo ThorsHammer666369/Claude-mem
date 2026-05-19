@@ -295,8 +295,19 @@ describe('PendingMessageStore current schema guardrails', () => {
       const indexes = getIndexNames(db, 'pending_messages');
 
       expect(columns).toContain('tool_use_id');
+      expect(columns).toContain('attempt_count');
+      expect(columns).toContain('last_error');
+      expect(columns).toContain('available_at_epoch_ms');
+      expect(columns).toContain('status_reason');
+      expect(columns).toContain('priority');
+      expect(columns).toContain('size_chars');
       expect(columns).not.toContain('worker_pid');
       expect(indexes).not.toContain('idx_pending_messages_worker_pid');
+
+      const deadLetterColumns = getColumnNames(db, 'pending_message_dead_letters');
+      expect(deadLetterColumns).toContain('original_message_id');
+      expect(deadLetterColumns).toContain('source_payload');
+      expect(getIndexNames(db, 'pending_message_dead_letters')).toContain('idx_pending_dead_letters_session');
 
       const sessionDbId = store.createSDKSession('content-claim-current', 'test-project', 'initial prompt');
       const pendingStore = new PendingMessageStore(db, () => {});

@@ -7,6 +7,7 @@ import {
   type InspectableObservationQueueEngine,
   type ObservationQueueHealth
 } from '../../server/queue/ObservationQueueEngine.js';
+import type { QueueStats } from '../sqlite/PendingMessageStore.js';
 import { BullMqObservationQueueEngine } from '../../server/queue/BullMqObservationQueueEngine.js';
 import { getObservationQueueEngineName } from '../../server/queue/redis-config.js';
 import { getSdkProcessForSession, ensureSdkProcessExit } from '../../supervisor/process-registry.js';
@@ -170,6 +171,8 @@ export class SessionManager {
       cumulativeOutputTokens: 0,
       earliestPendingTimestamp: null,
       claimedMessageIds: [],
+      claimedMessageAttempts: {},
+      claimedMessageTimestamps: {},
       conversationHistory: [],  // Initialize empty - will be populated by agents
       currentProvider: null,  // Will be set when generator starts
       consecutiveRestarts: 0,  // DEPRECATED: use restartGuard. Kept for logging compat.
@@ -295,6 +298,8 @@ export class SessionManager {
     const session = this.sessions.get(sessionDbId);
     if (session) {
       session.claimedMessageIds = [];
+      session.claimedMessageAttempts = {};
+      session.claimedMessageTimestamps = {};
     }
     return await this.getQueueEngine().resetProcessingToPending(sessionDbId);
   }
@@ -302,15 +307,111 @@ export class SessionManager {
   async confirmClaimedMessages(sessionDbId: number): Promise<number> {
     const session = this.sessions.get(sessionDbId);
     const claimedIds = session?.claimedMessageIds ?? [];
-    let confirmed = 0;
-    for (const messageId of claimedIds) {
-      confirmed += await this.getQueueEngine().confirmProcessed(messageId);
-    }
+    const confirmed = await this.confirmClaimedMessageIds(sessionDbId, claimedIds);
     if (session) {
       session.claimedMessageIds = [];
+      session.claimedMessageAttempts = {};
+      session.claimedMessageTimestamps = {};
       session.earliestPendingTimestamp = null;
     }
     return confirmed;
+  }
+
+  async confirmClaimedMessageIds(sessionDbId: number, messageIds: number[]): Promise<number> {
+    const session = this.sessions.get(sessionDbId);
+    const scopedIds = getScopedClaimedIds(session, messageIds);
+    if (scopedIds.length === 0) {
+      return 0;
+    }
+
+    const confirmed = await this.getQueueEngine().confirmProcessedBatch(scopedIds);
+    if (session) {
+      removeScopedClaimState(session, scopedIds);
+    }
+    return confirmed;
+  }
+
+  async retryOrFailClaimedMessages(
+    sessionDbId: number,
+    reason: string,
+    maxAttempts: number,
+    availableAtEpochMs: number
+  ): Promise<{ retried: number; failed: number }> {
+    const session = this.sessions.get(sessionDbId);
+    const claimedIds = session?.claimedMessageIds ?? [];
+    const result = await this.retryOrFailClaimedMessageIds(
+      sessionDbId,
+      claimedIds,
+      reason,
+      maxAttempts,
+      availableAtEpochMs
+    );
+    if (session) {
+      session.claimedMessageIds = [];
+      session.claimedMessageAttempts = {};
+      session.claimedMessageTimestamps = {};
+      session.earliestPendingTimestamp = null;
+    }
+    return result;
+  }
+
+  async retryOrFailClaimedMessageIds(
+    sessionDbId: number,
+    messageIds: number[],
+    reason: string,
+    maxAttempts: number,
+    availableAtEpochMs: number
+  ): Promise<{ retried: number; failed: number }> {
+    const session = this.sessions.get(sessionDbId);
+    const claimedIds = getScopedClaimedIds(session, messageIds);
+    const attempts = session?.claimedMessageAttempts ?? {};
+    if (claimedIds.length === 0) {
+      return { retried: 0, failed: 0 };
+    }
+
+    const retryIds: number[] = [];
+    const failIds: number[] = [];
+    const hardMaxAttempts = Math.max(1, Math.floor(maxAttempts));
+
+    for (const messageId of claimedIds) {
+      const nextAttempt = (attempts[messageId] ?? 0) + 1;
+      if (nextAttempt >= hardMaxAttempts) {
+        failIds.push(messageId);
+      } else {
+        retryIds.push(messageId);
+      }
+    }
+
+    const queue = this.getQueueEngine();
+    const retried = retryIds.length > 0
+      ? await queue.scheduleRetry(retryIds, reason, availableAtEpochMs)
+      : 0;
+    const failed = failIds.length > 0
+      ? await queue.moveMessagesToDeadLetter(failIds, reason, reason)
+      : 0;
+
+    if (session) {
+      removeScopedClaimState(session, claimedIds);
+    }
+
+    if (retried > 0) {
+      logger.warn('QUEUE', 'Message retry scheduled', {
+        sessionDbId,
+        count: retried,
+        reason,
+        availableAtEpochMs,
+      });
+    }
+    if (failed > 0) {
+      logger.warn('QUEUE', 'Message marked failed', {
+        sessionDbId,
+        count: failed,
+        reason,
+        maxAttempts: hardMaxAttempts,
+      });
+    }
+
+    return { retried, failed };
   }
 
   async deleteSession(sessionDbId: number): Promise<void> {
@@ -416,6 +517,10 @@ export class SessionManager {
     return await this.getQueueEngine().getTotalQueueDepth();
   }
 
+  async getQueueStats(sessionDbId?: number): Promise<QueueStats> {
+    return await this.getQueueEngine().getQueueStats(sessionDbId);
+  }
+
   async getTotalActiveWork(): Promise<number> {
     return await this.getTotalQueueDepth();
   }
@@ -444,6 +549,10 @@ export class SessionManager {
       }
     })) {
       session.claimedMessageIds.push(message._persistentId);
+      session.claimedMessageAttempts ??= {};
+      session.claimedMessageAttempts[message._persistentId] = message.attemptCount ?? 0;
+      session.claimedMessageTimestamps ??= {};
+      session.claimedMessageTimestamps[message._persistentId] = message._originalTimestamp;
       if (session.earliestPendingTimestamp === null) {
         session.earliestPendingTimestamp = message._originalTimestamp;
       } else {
@@ -463,4 +572,35 @@ export class SessionManager {
 
 function isHealthCheckedQueue(queue: InspectableObservationQueueEngine): queue is HealthCheckedObservationQueueEngine {
   return 'getHealth' in queue && 'assertHealthy' in queue;
+}
+
+function getScopedClaimedIds(session: ActiveSession | undefined, messageIds: number[]): number[] {
+  if (!session) {
+    return [];
+  }
+  const requested = new Set(messageIds.filter(id => Number.isInteger(id) && id > 0));
+  return session.claimedMessageIds.filter(id => requested.has(id));
+}
+
+function removeScopedClaimState(session: ActiveSession, handledIds: number[]): void {
+  const handled = new Set(handledIds);
+  session.claimedMessageIds = session.claimedMessageIds.filter(id => !handled.has(id));
+  if (session.claimedMessageAttempts) {
+    for (const id of handled) {
+      delete session.claimedMessageAttempts[id];
+    }
+  }
+  if (session.claimedMessageTimestamps) {
+    for (const id of handled) {
+      delete session.claimedMessageTimestamps[id];
+    }
+    const remainingTimestamps = session.claimedMessageIds
+      .map(id => session.claimedMessageTimestamps?.[id])
+      .filter((value): value is number => typeof value === 'number');
+    session.earliestPendingTimestamp = remainingTimestamps.length > 0
+      ? Math.min(...remainingTimestamps)
+      : null;
+  } else if (session.claimedMessageIds.length === 0) {
+    session.earliestPendingTimestamp = null;
+  }
 }

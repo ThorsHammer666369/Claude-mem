@@ -2,7 +2,7 @@
 import { DatabaseManager } from './DatabaseManager.js';
 import { SessionManager } from './SessionManager.js';
 import { logger } from '../../utils/logger.js';
-import { buildInitPrompt, buildObservationPrompt, buildSummaryPrompt, buildContinuationPrompt } from '../../sdk/prompts.js';
+import { buildInitPrompt, buildSummaryPrompt, buildContinuationPrompt } from '../../sdk/prompts.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH, OBSERVER_SESSIONS_DIR, ensureDir, paths } from '../../shared/paths.js';
 import { buildIsolatedEnvWithFreshOAuth, getAuthMethodDescription } from '../../shared/EnvManager.js';
@@ -22,10 +22,20 @@ import {
   shouldAbortForQuota,
   type RateLimitInfo,
 } from './RateLimitStore.js';
+import { SmartLlmDrain, type DrainItem } from './llm/SmartLlmDrain.js';
+import { parseSmartLlmDrainOptions } from './llm/SmartLlmDrainSettings.js';
+import { SmartLlmContextSplitter } from './llm/SmartLlmContextSplitter.js';
+import {
+  buildObservationPromptFromDrainItem,
+  getDrainItemAgentMetadata,
+  getDrainItemCwd,
+  getDrainItemPromptNumber,
+} from './llm/SmartLlmDrainPromptBuilder.js';
+import { recordSmartLlmDrainMetrics } from './llm/SmartLlmDrainMetricsRegistry.js';
 
 // @ts-ignore - Agent SDK types may not be available
 import { query } from '@anthropic-ai/claude-agent-sdk';
-import { ClassifiedProviderError } from './provider-errors.js';
+import { ClassifiedProviderError, isContextOverflowMessage } from './provider-errors.js';
 
 /**
  * Module-scoped guard so the "effort parameter" hint only fires once per
@@ -93,12 +103,8 @@ export function classifyClaudeError(err: unknown): ClassifiedProviderError {
   }
 
   // Context overflow — unrecoverable in this session, requires reset.
-  if (
-    message.includes('Prompt is too long') ||
-    message.includes('prompt is too long') ||
-    message.includes('context window')
-  ) {
-    return new ClassifiedProviderError(message, { kind: 'unrecoverable', cause: err });
+  if (isContextOverflowMessage(message)) {
+    return new ClassifiedProviderError(message, { kind: 'context_overflow', cause: err });
   }
 
   // HTTP 400 from the Anthropic SDK — bad request, never recoverable. Mirrors
@@ -372,7 +378,8 @@ export class ClaudeProvider {
             originalTimestamp,
             'SDK',
             cwdTracker.lastCwd,
-            modelId
+            modelId,
+            session.activeSplitPart ? { splitPart: session.activeSplitPart } : undefined
           );
         }
 
@@ -426,47 +433,27 @@ export class ClaudeProvider {
       isSynthetic: true
     };
 
-    for await (const message of this.sessionManager.getMessageIterator(session.sessionDbId)) {
-      session.pendingAgentId = message.agentId ?? null;
-      session.pendingAgentType = message.agentType ?? null;
+    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    const drainOptions = parseSmartLlmDrainOptions(settings);
+    const drain = new SmartLlmDrain(drainOptions, {
+      getQueueDepth: () => this.sessionManager.getTotalQueueDepth(),
+      onMetrics: metrics => recordSmartLlmDrainMetrics('SDK', metrics),
+    });
+    const splitter = new SmartLlmContextSplitter(drainOptions.contextSplit);
 
-      if (message.cwd) {
-        cwdTracker.lastCwd = message.cwd;
-      }
-
-      if (message.type === 'observation') {
-        if (message.prompt_number !== undefined) {
-          session.lastPromptNumber = message.prompt_number;
-        }
-
-        const obsPrompt = buildObservationPrompt({
-          id: 0, // Not used in prompt
-          tool_name: message.tool_name!,
-          tool_input: JSON.stringify(message.tool_input),
-          tool_output: JSON.stringify(message.tool_response),
-          created_at_epoch: Date.now(),
-          cwd: message.cwd
-        });
-
-        session.conversationHistory.push({ role: 'user', content: obsPrompt });
-
-        yield {
-          type: 'user',
-          message: {
-            role: 'user',
-            content: obsPrompt
-          },
-          session_id: session.contentSessionId,
-          parent_tool_use_id: null,
-          isSynthetic: true
-        };
-      } else if (message.type === 'summarize') {
+    for await (const item of drain.drain(
+      this.sessionManager.getMessageIterator(session.sessionDbId),
+      session.abortController.signal
+    )) {
+      if (item.kind === 'single' && item.message.type === 'summarize') {
+        this.applyDrainItemMetadata(session, item, cwdTracker);
+        session.activeSplitPart = null;
         const summaryPrompt = buildSummaryPrompt({
           id: session.sessionDbId,
           memory_session_id: session.memorySessionId,
           project: session.project,
           user_prompt: session.userPrompt,
-          last_assistant_message: message.last_assistant_message || ''
+          last_assistant_message: item.message.last_assistant_message || ''
         }, mode);
 
         session.conversationHistory.push({ role: 'user', content: summaryPrompt });
@@ -481,7 +468,74 @@ export class ClaudeProvider {
           parent_tool_use_id: null,
           isSynthetic: true
         };
+      } else {
+        if (item.kind !== 'single') {
+          logger.info('QUEUE', item.kind === 'coalesced' ? 'Coalesced observations' : 'Batched observations', {
+            sessionDbId: session.sessionDbId,
+            sourceIds: item.sourceIds,
+            count: item.sourceIds.length,
+            mode: drainOptions.mode,
+          });
+        }
+
+        const parts = splitter.split(item);
+        if (parts.length > 1) {
+          logger.info('QUEUE', 'Split observation drain item for provider sends', {
+            sessionDbId: session.sessionDbId,
+            splitGroupId: parts[0].splitMetadata?.splitGroupId,
+            splitTotal: parts.length,
+            originalSourceIds: item.sourceIds,
+          });
+        }
+
+        for (const part of parts) {
+          this.applyDrainItemMetadata(session, part, cwdTracker);
+          session.activeSplitPart = part.splitMetadata ?? null;
+
+          const obsPrompt = buildObservationPromptFromDrainItem(
+            part,
+            session.earliestPendingTimestamp ?? Date.now()
+          );
+
+          session.conversationHistory.push({ role: 'user', content: obsPrompt });
+
+          yield {
+            type: 'user',
+            message: {
+              role: 'user',
+              content: obsPrompt
+            },
+            session_id: session.contentSessionId,
+            parent_tool_use_id: null,
+            isSynthetic: true
+          };
+
+          if (part.splitMetadata && !session.splitGroupProgress && !session.activeSplitPart) {
+            break;
+          }
+        }
       }
+    }
+    session.activeSplitPart = null;
+  }
+
+  private applyDrainItemMetadata(
+    session: ActiveSession,
+    item: DrainItem,
+    cwdTracker: { lastCwd: string | undefined }
+  ): void {
+    const metadata = getDrainItemAgentMetadata(item);
+    session.pendingAgentId = metadata.agentId;
+    session.pendingAgentType = metadata.agentType;
+
+    const cwd = getDrainItemCwd(item);
+    if (cwd) {
+      cwdTracker.lastCwd = cwd;
+    }
+
+    const promptNumber = getDrainItemPromptNumber(item);
+    if (promptNumber !== undefined) {
+      session.lastPromptNumber = promptNumber;
     }
   }
 

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { fileURLToPath } from 'url';
 
 describe('Hook Lifecycle - Event Handlers', () => {
   describe('worker fallback failure counter', () => {
@@ -468,7 +469,7 @@ describe('hookCommand - stderr suppression', () => {
     const { hookCommand } = await import('../src/cli/hook-command.js');
 
     const hookCommandSource = await Bun.file(
-      new URL('../src/cli/hook-command.ts', import.meta.url).pathname
+      fileURLToPath(new URL('../src/cli/hook-command.ts', import.meta.url))
     ).text();
 
     expect(hookCommandSource).toContain("import { logger }");

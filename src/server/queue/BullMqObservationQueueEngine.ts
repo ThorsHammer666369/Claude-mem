@@ -7,6 +7,7 @@ import { Redis } from 'ioredis';
 import type { PendingMessage, PendingMessageWithId } from '../../services/worker-types.js';
 import type { CreateIteratorOptions } from '../../services/queue/SessionQueueProcessor.js';
 import { logger } from '../../utils/logger.js';
+import type { QueueStats, QueueSessionStats } from '../../services/sqlite/PendingMessageStore.js';
 import type {
   HealthCheckedObservationQueueEngine,
   ObservationQueueHealth,
@@ -19,12 +20,16 @@ interface BullMqPendingPayload {
   contentSessionId: string;
   createdAtEpoch: number;
   message: PendingMessage;
+  attemptCount?: number;
+  lastError?: string;
+  statusReason?: string;
+  availableAtEpochMs?: number;
 }
 
 type BullMqJob = Pick<
   Job<BullMqPendingPayload>,
   'id' | 'data' | 'moveToCompleted' | 'moveToWait' | 'extendLock' | 'getState'
-  | 'remove'
+  | 'remove' | 'moveToFailed' | 'moveToDelayed'
 >;
 
 type BullMqQueue = Pick<
@@ -164,6 +169,10 @@ export class BullMqObservationQueueEngine
           ...job.data.message,
           _persistentId: claimId,
           _originalTimestamp: job.data.createdAtEpoch,
+          attemptCount: job.data.attemptCount ?? 0,
+          lastError: job.data.lastError ?? null,
+          availableAtEpochMs: job.data.availableAtEpochMs ?? null,
+          statusReason: job.data.statusReason ?? null,
         };
         continue;
       }
@@ -195,6 +204,83 @@ export class BullMqObservationQueueEngine
     await this.unregisterSessionIfEmpty(claimed.sessionDbId);
     this.options.onMutate?.();
     return 1;
+  }
+
+  async confirmProcessedBatch(messageIds: number[]): Promise<number> {
+    let confirmed = 0;
+    for (const messageId of uniqueIds(messageIds)) {
+      confirmed += await this.confirmProcessed(messageId);
+    }
+    return confirmed;
+  }
+
+  async scheduleRetry(messageIds: number[], reason: string, availableAtEpochMs: number): Promise<number> {
+    let scheduled = 0;
+    let retryError: Error | null = null;
+    for (const messageId of uniqueIds(messageIds)) {
+      const claimed = this.activeClaims.get(messageId);
+      if (!claimed) {
+        continue;
+      }
+      claimed.job.data.attemptCount = (claimed.job.data.attemptCount ?? 0) + 1;
+      claimed.job.data.lastError = reason;
+      claimed.job.data.statusReason = reason;
+      claimed.job.data.availableAtEpochMs = availableAtEpochMs;
+      const delayMs = availableAtEpochMs - Date.now();
+      try {
+        if (delayMs > 0) {
+          await claimed.job.moveToDelayed(availableAtEpochMs, claimed.token);
+        } else {
+          await claimed.job.moveToWait(claimed.token);
+        }
+      } catch (error) {
+        const normalized = this.toRedisUnavailableError(error);
+        retryError ??= normalized;
+        logger.warn('QUEUE', 'BullMQ retry scheduling failed', {
+          sessionDbId: claimed.sessionDbId,
+          jobId: claimed.job.id,
+          reason,
+          error: normalized.message,
+        });
+        continue;
+      }
+      this.finishClaim(messageId, claimed);
+      if (delayMs <= 0) {
+        this.getSessionRuntime(claimed.sessionDbId).events.emit('message');
+      }
+      scheduled++;
+    }
+    if (scheduled > 0) {
+      this.options.onMutate?.();
+    }
+    if (retryError) {
+      throw retryError;
+    }
+    return scheduled;
+  }
+
+  async moveMessagesToDeadLetter(messageIds: number[], reason: string, error?: string): Promise<number> {
+    let moved = 0;
+    for (const messageId of uniqueIds(messageIds)) {
+      const claimed = this.activeClaims.get(messageId);
+      if (!claimed) {
+        continue;
+      }
+      claimed.job.data.lastError = error ?? reason;
+      claimed.job.data.statusReason = reason;
+      try {
+        await claimed.job.moveToFailed(new Error(error ?? reason), claimed.token, false);
+      } catch (moveError) {
+        throw this.toRedisUnavailableError(moveError);
+      }
+      this.finishClaim(messageId, claimed);
+      await this.unregisterSessionIfEmpty(claimed.sessionDbId);
+      moved++;
+    }
+    if (moved > 0) {
+      this.options.onMutate?.();
+    }
+    return moved;
   }
 
   async clearPendingForSession(sessionDbId: number): Promise<number> {
@@ -265,6 +351,43 @@ export class BullMqObservationQueueEngine
       total += await this.getPendingCount(sessionDbId);
     }
     return total;
+  }
+
+  async getQueueStats(sessionDbId?: number): Promise<QueueStats> {
+    const sessionIds = sessionDbId === undefined
+      ? new Set<number>([...this.sessions.keys(), ...await this.getRegisteredSessionIds()])
+      : new Set<number>([sessionDbId]);
+    const sessions: QueueSessionStats[] = [];
+
+    for (const id of Array.from(sessionIds).sort((a, b) => a - b)) {
+      const queue = this.getSessionRuntime(id).queue;
+      const counts = await queue.getJobCounts('waiting', 'active', 'delayed', 'prioritized', 'waiting-children', 'failed');
+      const jobs = await queue.getJobs(['waiting', 'active', 'delayed', 'prioritized', 'waiting-children', 'failed'] as JobType[], 0, -1, true);
+      const now = Date.now();
+      const oldestCreatedAt = jobs.length > 0
+        ? Math.min(...jobs.map(job => job.data.createdAtEpoch))
+        : now;
+      const maxAttemptCount = jobs.reduce((max, job) => Math.max(max, job.data.attemptCount ?? 0), 0);
+      sessions.push({
+        sessionDbId: id,
+        pending: (counts.waiting ?? 0) + (counts.prioritized ?? 0) + (counts['waiting-children'] ?? 0),
+        processing: counts.active ?? 0,
+        delayed: counts.delayed ?? 0,
+        failed: counts.failed ?? 0,
+        oldestPendingAgeMs: jobs.length > 0 ? Math.max(0, now - oldestCreatedAt) : 0,
+        maxAttemptCount,
+      });
+    }
+
+    return {
+      totalPending: sessions.reduce((sum, item) => sum + item.pending, 0),
+      totalProcessing: sessions.reduce((sum, item) => sum + item.processing, 0),
+      totalDelayed: sessions.reduce((sum, item) => sum + item.delayed, 0),
+      totalFailed: sessions.reduce((sum, item) => sum + item.failed, 0),
+      oldestPendingAgeMs: sessions.reduce((max, item) => Math.max(max, item.oldestPendingAgeMs), 0),
+      maxAttemptCount: sessions.reduce((max, item) => Math.max(max, item.maxAttemptCount), 0),
+      sessions,
+    };
   }
 
   async peekPendingTypes(sessionDbId: number): Promise<Array<{ message_type: string; tool_name: string | null }>> {
@@ -544,4 +667,8 @@ function sha256(value: string): string {
 
 function sumCounts(counts: Record<string, number>): number {
   return QUEUE_JOB_TYPES.reduce((sum, type) => sum + (counts[type] ?? 0), 0);
+}
+
+function uniqueIds(ids: number[]): number[] {
+  return [...new Set(ids.filter(id => Number.isInteger(id) && id > 0))];
 }

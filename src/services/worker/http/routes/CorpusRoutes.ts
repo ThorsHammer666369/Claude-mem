@@ -77,6 +77,16 @@ export class CorpusRoutes extends BaseRouteHandler {
     app.post('/api/corpus/:name/reprime', validateBody(emptyBodySchema), this.handleReprimeCorpus.bind(this));
   }
 
+  private getNameParam(req: Request, res: Response): string | null {
+    const rawName = req.params.name;
+    const name = Array.isArray(rawName) ? rawName[0] : rawName;
+    if (!name) {
+      this.badRequest(res, 'Invalid name');
+      return null;
+    }
+    return name;
+  }
+
   private handleBuildCorpus = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
     const { name, description, project, types, concepts, files, query, date_start, date_end, limit } =
       req.body as z.infer<typeof buildCorpusSchema>;
@@ -105,7 +115,8 @@ export class CorpusRoutes extends BaseRouteHandler {
   });
 
   private handleGetCorpus = this.wrapHandler((req: Request, res: Response): void => {
-    const { name } = req.params;
+    const name = this.getNameParam(req, res);
+    if (!name) return;
     const corpus = this.corpusStore.read(name);
 
     if (!corpus) {
@@ -122,7 +133,8 @@ export class CorpusRoutes extends BaseRouteHandler {
   });
 
   private handleDeleteCorpus = this.wrapHandler((req: Request, res: Response): void => {
-    const { name } = req.params;
+    const name = this.getNameParam(req, res);
+    if (!name) return;
     const existed = this.corpusStore.delete(name);
 
     if (!existed) {
@@ -138,7 +150,8 @@ export class CorpusRoutes extends BaseRouteHandler {
   });
 
   private handleRebuildCorpus = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
-    const { name } = req.params;
+    const name = this.getNameParam(req, res);
+    if (!name) return;
     const existingCorpus = this.corpusStore.read(name);
 
     if (!existingCorpus) {
@@ -157,7 +170,8 @@ export class CorpusRoutes extends BaseRouteHandler {
   });
 
   private handlePrimeCorpus = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
-    const { name } = req.params;
+    const name = this.getNameParam(req, res);
+    if (!name) return;
     const corpus = this.corpusStore.read(name);
 
     if (!corpus) {
@@ -174,7 +188,8 @@ export class CorpusRoutes extends BaseRouteHandler {
   });
 
   private handleQueryCorpus = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
-    const { name } = req.params;
+    const name = this.getNameParam(req, res);
+    if (!name) return;
     const corpus = this.corpusStore.read(name);
 
     if (!corpus) {
@@ -192,7 +207,8 @@ export class CorpusRoutes extends BaseRouteHandler {
   });
 
   private handleReprimeCorpus = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
-    const { name } = req.params;
+    const name = this.getNameParam(req, res);
+    if (!name) return;
     const corpus = this.corpusStore.read(name);
 
     if (!corpus) {

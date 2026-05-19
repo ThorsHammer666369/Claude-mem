@@ -23,6 +23,8 @@ export interface ActiveSession {
   cumulativeOutputTokens: number;  
   earliestPendingTimestamp: number | null;  
   claimedMessageIds: number[];
+  claimedMessageAttempts?: Record<number, number>;
+  claimedMessageTimestamps?: Record<number, number>;
   conversationHistory: ConversationMessage[];  
   currentProvider: 'claude' | 'gemini' | 'openrouter' | null;  
   consecutiveRestarts: number;  
@@ -34,6 +36,20 @@ export interface ActiveSession {
   lastSummaryStored?: boolean;
   pendingAgentId?: string | null;
   pendingAgentType?: string | null;
+  activeSplitPart?: {
+    splitGroupId: string;
+    splitIndex: number;
+    splitTotal: number;
+    originalSourceIds: number[];
+    parentMessageType: string;
+    reason: 'context_limit';
+  } | null;
+  splitGroupProgress?: {
+    splitGroupId: string;
+    splitTotal: number;
+    completedParts: number;
+    originalSourceIds: number[];
+  } | null;
   abortReason?: 'idle' | 'shutdown' | 'overflow' | 'restart-guard' | 'quota' | string | null;
   respawnTimer?: ReturnType<typeof setTimeout>;
 }
@@ -54,6 +70,12 @@ export interface PendingMessage {
 export interface PendingMessageWithId extends PendingMessage {
   _persistentId: number;
   _originalTimestamp: number;
+  attemptCount?: number;
+  lastError?: string | null;
+  availableAtEpochMs?: number | null;
+  statusReason?: string | null;
+  priority?: number;
+  sizeChars?: number;
 }
 
 export interface ObservationData {

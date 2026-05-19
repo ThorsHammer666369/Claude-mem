@@ -136,6 +136,42 @@ describe('MigrationRunner', () => {
       expect(versions).toContain(30);  
       expect(versions).toContain(33);
       expect(versions).toContain(34);
+      expect(versions).toContain(35);
+    });
+
+    it('should add queue metadata columns and dead-letter table', () => {
+      const runner = new MigrationRunner(db);
+      runner.runAllMigrations();
+
+      const pendingColumns = getColumns(db, 'pending_messages').map(column => column.name);
+      expect(pendingColumns).toContain('attempt_count');
+      expect(pendingColumns).toContain('last_error');
+      expect(pendingColumns).toContain('available_at_epoch_ms');
+      expect(pendingColumns).toContain('status_reason');
+      expect(pendingColumns).toContain('priority');
+      expect(pendingColumns).toContain('size_chars');
+
+      const tables = getTableNames(db);
+      expect(tables).toContain('pending_message_dead_letters');
+
+      const deadLetterColumns = getColumns(db, 'pending_message_dead_letters').map(column => column.name);
+      expect(deadLetterColumns).toEqual([
+        'id',
+        'original_message_id',
+        'session_db_id',
+        'content_session_id',
+        'message_type',
+        'tool_name',
+        'source_payload',
+        'attempt_count',
+        'status_reason',
+        'last_error',
+        'failed_at_epoch_ms',
+      ]);
+
+      const indexes = getIndexNames(db, 'pending_message_dead_letters');
+      expect(indexes).toContain('idx_pending_dead_letters_session');
+      expect(indexes).toContain('idx_pending_dead_letters_failed');
     });
 
     it('should create server-owned storage tables without changing legacy readability', () => {

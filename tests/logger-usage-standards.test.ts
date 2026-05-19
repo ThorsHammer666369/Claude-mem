@@ -6,6 +6,10 @@ import { readFileSync } from "fs";
 const PROJECT_ROOT = join(import.meta.dir, "..");
 const SRC_DIR = join(PROJECT_ROOT, "src");
 
+function toPosixPath(filePath: string): string {
+  return filePath.replace(/\\/g, "/");
+}
+
 const EXCLUDED_PATTERNS = [
   /types\//,             // Type definition files
   /constants\//,         // Pure constants
@@ -68,12 +72,12 @@ async function findTypeScriptFiles(dir: string): Promise<string[]> {
 }
 
 function shouldExclude(filePath: string): boolean {
-  const relativePath = relative(SRC_DIR, filePath);
+  const relativePath = toPosixPath(relative(SRC_DIR, filePath));
   return EXCLUDED_PATTERNS.some(pattern => pattern.test(relativePath));
 }
 
 function isHighPriority(filePath: string): boolean {
-  const relativePath = relative(SRC_DIR, filePath);
+  const relativePath = toPosixPath(relative(SRC_DIR, filePath));
 
   if (isUIFile(relativePath)) {
     return false;
@@ -85,7 +89,7 @@ function isHighPriority(filePath: string): boolean {
 function analyzeFile(filePath: string): FileAnalysis {
   const content = readFileSync(filePath, "utf-8");
   const lines = content.split("\n");
-  const relativePath = relative(PROJECT_ROOT, filePath);
+  const relativePath = toPosixPath(relative(PROJECT_ROOT, filePath));
 
   const hasLoggerImport = /import\s+.*logger.*from\s+['"].*logger(\.(js|ts))?['"]/.test(content);
 

@@ -115,6 +115,21 @@ export class SettingsRoutes extends BaseRouteHandler {
       'CLAUDE_MEM_CONTEXT_SHOW_LAST_SUMMARY',
       'CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE',
       'CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED',
+      'CLAUDE_MEM_MAX_CONCURRENT_AGENTS',
+      'CLAUDE_MEM_LLM_QUEUE_MODE',
+      'CLAUDE_MEM_LLM_MIN_SEND_INTERVAL_MS',
+      'CLAUDE_MEM_LLM_BATCH_MAX_ITEMS',
+      'CLAUDE_MEM_LLM_BATCH_MAX_CHARS',
+      'CLAUDE_MEM_LLM_COALESCE_WINDOW_MS',
+      'CLAUDE_MEM_LLM_ADAPTIVE_BACKOFF',
+      'CLAUDE_MEM_LLM_MAX_ATTEMPTS',
+      'CLAUDE_MEM_LLM_CONTEXT_SPLIT_ENABLED',
+      'CLAUDE_MEM_LLM_CONTEXT_MAX_CHARS',
+      'CLAUDE_MEM_LLM_CONTEXT_SPLIT_MAX_PARTS',
+      'CLAUDE_MEM_QUEUE_HIGH_WATERMARK',
+      'CLAUDE_MEM_QUEUE_CRITICAL_WATERMARK',
+      'CLAUDE_MEM_QUEUE_DROP_POLICY',
+      'CLAUDE_MEM_QUEUE_METRICS_ENABLED',
     ];
 
     for (const key of settingKeys) {
@@ -294,6 +309,80 @@ export class SettingsRoutes extends BaseRouteHandler {
       }
     }
 
+    if (settings.CLAUDE_MEM_LLM_QUEUE_MODE !== undefined) {
+      if (!['off', 'auto', 'local_safe'].includes(settings.CLAUDE_MEM_LLM_QUEUE_MODE)) {
+        return { valid: false, error: 'CLAUDE_MEM_LLM_QUEUE_MODE must be "off", "auto", or "local_safe"' };
+      }
+    }
+
+    if (settings.CLAUDE_MEM_QUEUE_DROP_POLICY !== undefined) {
+      if (settings.CLAUDE_MEM_QUEUE_DROP_POLICY !== 'coalesce_low_value') {
+        return { valid: false, error: 'CLAUDE_MEM_QUEUE_DROP_POLICY must be "coalesce_low_value"' };
+      }
+    }
+
+    const llmQueueBooleanSettings = [
+      'CLAUDE_MEM_LLM_ADAPTIVE_BACKOFF',
+      'CLAUDE_MEM_QUEUE_METRICS_ENABLED',
+    ];
+
+    for (const key of llmQueueBooleanSettings) {
+      if (settings[key] !== undefined && !['true', 'false'].includes(settings[key])) {
+        return { valid: false, error: `${key} must be "true" or "false"` };
+      }
+    }
+
+    const llmQueueNumericSettings: Array<[string, number, number]> = [
+      ['CLAUDE_MEM_MAX_CONCURRENT_AGENTS', 1, 16],
+      ['CLAUDE_MEM_LLM_MIN_SEND_INTERVAL_MS', 0, 60000],
+      ['CLAUDE_MEM_LLM_BATCH_MAX_ITEMS', 1, 100],
+      ['CLAUDE_MEM_LLM_BATCH_MAX_CHARS', 1000, 1000000],
+      ['CLAUDE_MEM_LLM_COALESCE_WINDOW_MS', 0, 600000],
+      ['CLAUDE_MEM_LLM_MAX_ATTEMPTS', 1, 20],
+      ['CLAUDE_MEM_QUEUE_HIGH_WATERMARK', 1, 1000000],
+      ['CLAUDE_MEM_QUEUE_CRITICAL_WATERMARK', 1, 1000000],
+    ];
+
+    for (const [key, min, max] of llmQueueNumericSettings) {
+      if (settings[key] !== undefined) {
+        const value = this.parseStrictIntegerString(settings[key]);
+        if (value === null || value < min || value > max) {
+          return { valid: false, error: `${key} must be between ${min} and ${max}` };
+        }
+      }
+    }
+
+    if (
+      settings.CLAUDE_MEM_QUEUE_HIGH_WATERMARK !== undefined &&
+      settings.CLAUDE_MEM_QUEUE_CRITICAL_WATERMARK !== undefined
+    ) {
+      const highWatermark = this.parseStrictIntegerString(settings.CLAUDE_MEM_QUEUE_HIGH_WATERMARK);
+      const criticalWatermark = this.parseStrictIntegerString(settings.CLAUDE_MEM_QUEUE_CRITICAL_WATERMARK);
+      if (highWatermark !== null && criticalWatermark !== null && criticalWatermark < highWatermark) {
+        return { valid: false, error: 'CLAUDE_MEM_QUEUE_CRITICAL_WATERMARK must be greater than or equal to CLAUDE_MEM_QUEUE_HIGH_WATERMARK' };
+      }
+    }
+
+    if (settings.CLAUDE_MEM_LLM_CONTEXT_SPLIT_ENABLED !== undefined) {
+      if (!['true', 'false'].includes(settings.CLAUDE_MEM_LLM_CONTEXT_SPLIT_ENABLED)) {
+        return { valid: false, error: 'CLAUDE_MEM_LLM_CONTEXT_SPLIT_ENABLED must be "true" or "false"' };
+      }
+    }
+
+    if (settings.CLAUDE_MEM_LLM_CONTEXT_MAX_CHARS !== undefined) {
+      const maxChars = this.parseStrictIntegerString(settings.CLAUDE_MEM_LLM_CONTEXT_MAX_CHARS);
+      if (maxChars === null || maxChars < 1000 || maxChars > 1000000) {
+        return { valid: false, error: 'CLAUDE_MEM_LLM_CONTEXT_MAX_CHARS must be between 1000 and 1000000' };
+      }
+    }
+
+    if (settings.CLAUDE_MEM_LLM_CONTEXT_SPLIT_MAX_PARTS !== undefined) {
+      const maxParts = this.parseStrictIntegerString(settings.CLAUDE_MEM_LLM_CONTEXT_SPLIT_MAX_PARTS);
+      if (maxParts === null || maxParts < 1 || maxParts > 100) {
+        return { valid: false, error: 'CLAUDE_MEM_LLM_CONTEXT_SPLIT_MAX_PARTS must be between 1 and 100' };
+      }
+    }
+
     if (settings.CLAUDE_MEM_OPENROUTER_MAX_CONTEXT_MESSAGES) {
       const count = parseInt(settings.CLAUDE_MEM_OPENROUTER_MAX_CONTEXT_MESSAGES, 10);
       if (isNaN(count) || count < 1 || count > 100) {
@@ -318,6 +407,13 @@ export class SettingsRoutes extends BaseRouteHandler {
     }
 
     return { valid: true };
+  }
+
+  private parseStrictIntegerString(value: unknown): number | null {
+    if (typeof value !== 'string' && typeof value !== 'number') return null;
+    const rawValue = String(value);
+    if (!/^\d+$/.test(rawValue)) return null;
+    return Number.parseInt(rawValue, 10);
   }
 
   private isMcpEnabled(): boolean {

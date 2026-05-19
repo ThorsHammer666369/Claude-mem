@@ -28,6 +28,7 @@ mock.module('../../../src/shared/transcript-parser.js', () => ({
 
 const workerCallLog: Array<{ path: string; method: string; body: any }> = [];
 mock.module('../../../src/shared/worker-utils.js', () => ({
+  fetchWithTimeout: (url: string, init: RequestInit = {}, _timeoutMs: number) => fetch(url, init),
   ensureWorkerRunning: () => Promise.resolve(true),
   getWorkerPort: () => 37777,
   workerHttpRequest: (apiPath: string, options?: any) => {

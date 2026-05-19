@@ -25,6 +25,30 @@ function restoreLogger(): void {
   loggerSpies = [];
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function removeTempDirWithRetry(dir: string): Promise<void> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 8; attempt++) {
+    try {
+      Bun.gc(true);
+      rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch (error: unknown) {
+      const code = error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined;
+      if (code !== 'EBUSY' && code !== 'EPERM') {
+        throw error;
+      }
+      lastError = error;
+      Bun.gc(true);
+      await sleep(50 * (attempt + 1));
+    }
+  }
+  throw lastError;
+}
+
 function seedDatabase(dbPath: string, opts: { observerSessions: number; stuckCount: number }): { observerSessionDbIds: number[]; keepSessionDbId: number } {
   const seed = new ClaudeMemDatabase(dbPath);
   const db = seed.db;
@@ -64,6 +88,7 @@ function seedDatabase(dbPath: string, opts: { observerSessions: number; stuckCou
     insertPending.run(keepSessionDbId, epoch);
   }
 
+  db.run('PRAGMA wal_checkpoint(TRUNCATE)');
   seed.close();
   return { observerSessionDbIds, keepSessionDbId };
 }
@@ -76,9 +101,9 @@ describe('runOneTimeV12_4_3Cleanup', () => {
     silenceLogger();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     restoreLogger();
-    rmSync(tmpDataDir, { recursive: true, force: true });
+    await removeTempDirWithRetry(tmpDataDir);
   });
 
   it('writes a no-db marker when the DB is missing', () => {

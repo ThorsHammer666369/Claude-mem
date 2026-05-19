@@ -10,6 +10,7 @@ import type { PendingMessage } from '../../../src/services/worker-types.js';
 class FakeJob {
   state: string = 'waiting';
   failMoveToWait = false;
+  delayedUntil = 0;
 
   constructor(
     readonly id: string,
@@ -34,7 +35,18 @@ class FakeJob {
       throw new Error('moveToWait failed');
     }
     this.state = 'waiting';
+    this.delayedUntil = 0;
     return 0;
+  }
+
+  async moveToDelayed(timestamp: number): Promise<number> {
+    this.state = 'delayed';
+    this.delayedUntil = timestamp;
+    return 0;
+  }
+
+  async moveToFailed(): Promise<void> {
+    this.state = 'failed';
   }
 
   async extendLock(): Promise<number> {
@@ -63,10 +75,12 @@ class FakeQueue {
   }
 
   async getJobCounts(...types: string[]): Promise<Record<string, number>> {
+    this.promoteDueDelayedJobs();
     return Object.fromEntries(types.map(type => [type, this.jobs.filter(job => job.state === type).length]));
   }
 
   async getJobs(types: string[]): Promise<FakeJob[]> {
+    this.promoteDueDelayedJobs();
     return this.jobs.filter(job => types.includes(job.state));
   }
 
@@ -82,11 +96,22 @@ class FakeQueue {
   }
 
   async claimNext(): Promise<FakeJob | undefined> {
+    this.promoteDueDelayedJobs();
     const job = this.jobs.find(item => item.state === 'waiting');
     if (job) {
       job.state = 'active';
     }
     return job;
+  }
+
+  private promoteDueDelayedJobs(): void {
+    const now = Date.now();
+    for (const job of this.jobs) {
+      if (job.state === 'delayed' && job.delayedUntil <= now) {
+        job.state = 'waiting';
+        job.delayedUntil = 0;
+      }
+    }
   }
 }
 
@@ -296,6 +321,142 @@ describe('BullMqObservationQueueEngine', () => {
     expect(await engine.confirmProcessed(second.value._persistentId)).toBe(1);
     expect(await engine.getPendingCount(1)).toBe(0);
     expect(await result.redis.smembers('test_prefix:queue_registry:sessions')).toEqual([]);
+
+    controller.abort();
+    await iterator.return?.();
+  });
+
+  test('confirms a batch of active jobs', async () => {
+    const result = createEngine();
+    engine = result.engine;
+
+    await engine.enqueue(1, 'content-session', {
+      type: 'observation',
+      tool_name: 'First',
+      toolUseId: 'tool-a',
+    });
+    await engine.enqueue(1, 'content-session', {
+      type: 'observation',
+      tool_name: 'Second',
+      toolUseId: 'tool-b',
+    });
+
+    const controller = new AbortController();
+    const iterator = engine.createIterator({
+      sessionDbId: 1,
+      signal: controller.signal,
+      idleTimeoutMs: 100,
+    });
+    const first = await iterator.next();
+    const second = await iterator.next();
+
+    expect(await engine.confirmProcessedBatch([first.value._persistentId, second.value._persistentId])).toBe(2);
+    expect(await engine.getPendingCount(1)).toBe(0);
+
+    controller.abort();
+    await iterator.return?.();
+  });
+
+  test('schedules retry by delaying future jobs and exposes stats', async () => {
+    const result = createEngine();
+    engine = result.engine;
+
+    await engine.enqueue(1, 'content-session', {
+      type: 'observation',
+      tool_name: 'Read',
+      toolUseId: 'tool-a',
+    });
+
+    const controller = new AbortController();
+    const iterator = engine.createIterator({
+      sessionDbId: 1,
+      signal: controller.signal,
+      idleTimeoutMs: 100,
+    });
+    const first = await iterator.next();
+
+    const availableAt = Date.now() + 1000;
+    expect(await engine.scheduleRetry([first.value._persistentId], 'provider_timeout', availableAt)).toBe(1);
+    expect(result.queues.get('claude_mem_session_1')!.jobs[0].state).toBe('delayed');
+    expect(result.queues.get('claude_mem_session_1')!.jobs[0].delayedUntil).toBe(availableAt);
+
+    const stats = await engine.getQueueStats(1);
+    expect(stats.totalPending).toBe(0);
+    expect(stats.totalDelayed).toBe(1);
+    expect(stats.totalProcessing).toBe(0);
+
+    controller.abort();
+    await iterator.return?.();
+  });
+
+  test('delayed retry is not yielded until availableAtEpochMs', async () => {
+    const result = createEngine();
+    engine = result.engine;
+
+    await engine.enqueue(1, 'content-session', {
+      type: 'observation',
+      tool_name: 'Read',
+      toolUseId: 'tool-a',
+    });
+
+    const firstController = new AbortController();
+    const firstIterator = engine.createIterator({
+      sessionDbId: 1,
+      signal: firstController.signal,
+      idleTimeoutMs: 500,
+    });
+    const first = await firstIterator.next();
+    expect(first.value.tool_name).toBe('Read');
+
+    const availableAt = Date.now() + 50;
+    expect(await engine.scheduleRetry([first.value._persistentId], 'provider_timeout', availableAt)).toBe(1);
+    expect(result.queues.get('claude_mem_session_1')!.jobs[0].state).toBe('delayed');
+
+    let yieldedEarly = false;
+    const pendingNext = firstIterator.next().then(result => {
+      yieldedEarly = true;
+      return result;
+    });
+    const early = await Promise.race([
+      pendingNext.then(() => 'yielded' as const),
+      new Promise<'not-yet'>(resolve => setTimeout(() => resolve('not-yet'), 20)),
+    ]);
+    expect(early).toBe('not-yet');
+    expect(yieldedEarly).toBe(false);
+
+    const retried = await pendingNext;
+    expect(retried.done).toBe(false);
+    expect(retried.value.tool_name).toBe('Read');
+    expect(retried.value.attemptCount).toBe(1);
+    expect(retried.value.availableAtEpochMs).toBe(availableAt);
+
+    firstController.abort();
+    await firstIterator.return?.();
+  });
+
+  test('moves active jobs to failed/dead-letter accounting', async () => {
+    const result = createEngine();
+    engine = result.engine;
+
+    await engine.enqueue(1, 'content-session', {
+      type: 'observation',
+      tool_name: 'Read',
+      toolUseId: 'tool-a',
+    });
+
+    const controller = new AbortController();
+    const iterator = engine.createIterator({
+      sessionDbId: 1,
+      signal: controller.signal,
+      idleTimeoutMs: 100,
+    });
+    const first = await iterator.next();
+
+    expect(await engine.moveMessagesToDeadLetter([first.value._persistentId], 'max_attempts', 'empty response')).toBe(1);
+    expect(result.queues.get('claude_mem_session_1')!.jobs[0].state).toBe('failed');
+
+    const stats = await engine.getQueueStats(1);
+    expect(stats.totalFailed).toBe(1);
 
     controller.abort();
     await iterator.return?.();

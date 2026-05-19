@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'bun:test';
 import {
   ClassifiedProviderError,
+  isProviderContextOverflowError,
   isClassified,
 } from '../../src/services/worker/provider-errors.js';
 import { classifyClaudeError } from '../../src/services/worker/ClaudeProvider.js';
@@ -90,6 +91,16 @@ describe('classifyGeminiError', () => {
     });
     expect(err.kind).toBe('unrecoverable');
   });
+
+  it('classifies context-window 400 as context_overflow', () => {
+    const err = classifyGeminiError({
+      status: 400,
+      bodyText: 'input token count exceeds the maximum context window for this model',
+      cause: new Error('400 context overflow'),
+    });
+    expect(err.kind).toBe('context_overflow');
+    expect(isProviderContextOverflowError(err)).toBe(true);
+  });
 });
 
 describe('classifyOpenRouterError', () => {
@@ -158,6 +169,16 @@ describe('classifyOpenRouterError', () => {
     const err = classifyOpenRouterError({ cause });
     expect(err.kind).toBe('transient');
   });
+
+  it('classifies prompt-length 400 as context_overflow', () => {
+    const err = classifyOpenRouterError({
+      status: 400,
+      bodyText: 'prompt is too long for the selected model context window',
+      cause: new Error('400 context overflow'),
+    });
+    expect(err.kind).toBe('context_overflow');
+    expect(isProviderContextOverflowError(err)).toBe(true);
+  });
 });
 
 describe('classifyClaudeError', () => {
@@ -209,9 +230,10 @@ describe('classifyClaudeError', () => {
     expect(err.kind).toBe('unrecoverable');
   });
 
-  it('classifies prompt-too-long as unrecoverable', () => {
+  it('classifies prompt-too-long as context_overflow', () => {
     const err = classifyClaudeError(new Error('Claude session context overflow: prompt is too long'));
-    expect(err.kind).toBe('unrecoverable');
+    expect(err.kind).toBe('context_overflow');
+    expect(isProviderContextOverflowError(err)).toBe(true);
   });
 
   it('classifies status=429 as rate_limit', () => {

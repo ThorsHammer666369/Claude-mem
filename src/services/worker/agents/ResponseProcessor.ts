@@ -13,6 +13,18 @@ import type { DatabaseManager } from '../DatabaseManager.js';
 import type { SessionManager } from '../SessionManager.js';
 import type { WorkerRef, StorageResult } from './types.js';
 import { broadcastObservation, broadcastSummary } from './ObservationBroadcaster.js';
+import { parseSmartLlmDrainOptions } from '../llm/SmartLlmDrainSettings.js';
+import type { SplitDrainMetadata } from '../llm/SmartLlmDrain.js';
+import { ClassifiedProviderError } from '../provider-errors.js';
+
+export type AgentResponseOutcome =
+  | { kind: 'stored'; observationCount: number; summaryStored: boolean }
+  | { kind: 'invalid'; empty: boolean; retried: number; failed: number }
+  | { kind: 'deferred'; reason: 'missing_memory_session_id' };
+
+export interface AgentResponseProcessingOptions {
+  splitPart?: SplitDrainMetadata;
+}
 
 export async function processAgentResponse(
   text: string,
@@ -24,26 +36,75 @@ export async function processAgentResponse(
   originalTimestamp: number | null,
   agentName: string,
   projectRoot?: string,
-  modelId?: string
-): Promise<void> {
+  modelId?: string,
+  options: AgentResponseProcessingOptions = {}
+): Promise<AgentResponseOutcome> {
   session.lastGeneratorActivity = Date.now();
-
-  if (text) {
-    session.conversationHistory.push({ role: 'assistant', content: text });
-  }
+  const splitPart = options.splitPart;
 
   const parsed = parseAgentXml(text, session.contentSessionId);
 
   if (!parsed.valid) {
     logger.warn('PARSER', `${agentName} returned non-XML/empty response — ignoring queued batch`, {
       sessionId: session.sessionDbId,
+      ...(splitPart ? splitLogContext(splitPart) : {}),
     });
-    // Plain-text skip responses are intentionally ignored. Re-queueing them
-    // creates an observer loop where the same low-signal batch is retried
-    // until the restart guard fires or the provider quota is exhausted.
-    await sessionManager.confirmClaimedMessages(session.sessionDbId);
-    session.earliestPendingTimestamp = null;
-    return;
+    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    const drainOptions = parseSmartLlmDrainOptions(settings);
+    const retryDelayMs = Math.max(250, drainOptions.minSendIntervalMs);
+    if (splitPart && hasStoredPreviousSplitPart(session, splitPart)) {
+      session.activeSplitPart = null;
+      session.splitGroupProgress = null;
+      logger.error('QUEUE', 'Invalid split response after partial split storage; hard-stopping session to avoid duplicate retry', {
+        sessionDbId: session.sessionDbId,
+        reason: 'partial_split_invalid_response',
+        parserReason: parsed.reason,
+        ...splitLogContext(splitPart),
+      });
+      worker?.broadcastProcessingStatus?.();
+      throw new ClassifiedProviderError(
+        'Invalid partial split response after earlier split parts stored',
+        {
+          kind: 'unrecoverable',
+          cause: new Error(parsed.reason || 'invalid split response'),
+        }
+      );
+    }
+    const retryResult = splitPart
+      ? await sessionManager.retryOrFailClaimedMessageIds(
+        session.sessionDbId,
+        splitPart.originalSourceIds,
+        'invalid_or_empty_response',
+        drainOptions.maxAttempts,
+        Date.now() + retryDelayMs
+      )
+      : await sessionManager.retryOrFailClaimedMessages(
+        session.sessionDbId,
+        'invalid_or_empty_response',
+        drainOptions.maxAttempts,
+        Date.now() + retryDelayMs
+      );
+    logger.warn('QUEUE', 'Message retry/dead-letter decision after invalid provider response', {
+      sessionDbId: session.sessionDbId,
+      retried: retryResult.retried,
+      failed: retryResult.failed,
+      maxAttempts: drainOptions.maxAttempts,
+      ...(splitPart ? splitLogContext(splitPart) : {}),
+    });
+    if (!splitPart) {
+      session.earliestPendingTimestamp = null;
+    }
+    if (splitPart) {
+      session.activeSplitPart = null;
+      session.splitGroupProgress = null;
+    }
+    worker?.broadcastProcessingStatus?.();
+    return {
+      kind: 'invalid',
+      empty: !text.trim(),
+      retried: retryResult.retried,
+      failed: retryResult.failed,
+    };
   }
 
   if (!session.memorySessionId) {
@@ -54,7 +115,11 @@ export async function processAgentResponse(
     // count as "in progress" and trigger a respawn loop while we wait for the
     // memory session id to appear. The next generator pass will re-claim them.
     await sessionManager.resetProcessingToPending(session.sessionDbId);
-    return;
+    return { kind: 'deferred', reason: 'missing_memory_session_id' };
+  }
+
+  if (text) {
+    session.conversationHistory.push({ role: 'assistant', content: text });
   }
 
   const { observations, summary } = parsed;
@@ -108,10 +173,40 @@ export async function processAgentResponse(
     });
   }
 
-  await sessionManager.confirmClaimedMessages(session.sessionDbId);
-  session.earliestPendingTimestamp = null;
-  session.restartGuard?.recordSuccess();
-  worker?.broadcastProcessingStatus?.();
+  const splitCompletion = splitPart
+    ? recordSplitPartSuccess(session, splitPart)
+    : { complete: true, completedParts: 1 };
+
+  if (splitPart && !splitCompletion.complete) {
+    logger.info('QUEUE', 'Stored split part; deferring claim confirmation until remaining parts finish', {
+      sessionDbId: session.sessionDbId,
+      completedParts: splitCompletion.completedParts,
+      ...splitLogContext(splitPart),
+    });
+  } else {
+    if (splitPart) {
+      await sessionManager.confirmClaimedMessageIds(
+        session.sessionDbId,
+        splitPart.originalSourceIds
+      );
+    } else {
+      await sessionManager.confirmClaimedMessages(session.sessionDbId);
+    }
+    if (!splitPart) {
+      session.earliestPendingTimestamp = null;
+    }
+    session.restartGuard?.recordSuccess();
+    worker?.broadcastProcessingStatus?.();
+    if (splitPart) {
+      logger.info('QUEUE', 'All split parts stored; confirmed original claimed messages', {
+        sessionDbId: session.sessionDbId,
+        completedParts: splitCompletion.completedParts,
+        ...splitLogContext(splitPart),
+      });
+      session.activeSplitPart = null;
+      session.splitGroupProgress = null;
+    }
+  }
 
   void notifyTelegram({
     observations: labeledObservations,
@@ -141,6 +236,58 @@ export async function processAgentResponse(
     discoveryTokens,
     agentName
   );
+
+  return {
+    kind: 'stored',
+    observationCount: observations.length,
+    summaryStored: !!result.summaryId,
+  };
+}
+
+function hasStoredPreviousSplitPart(
+  session: ActiveSession,
+  splitPart: SplitDrainMetadata
+): boolean {
+  return !!session.splitGroupProgress &&
+    session.splitGroupProgress.splitGroupId === splitPart.splitGroupId &&
+    session.splitGroupProgress.completedParts > 0;
+}
+
+function recordSplitPartSuccess(
+  session: ActiveSession,
+  splitPart: SplitDrainMetadata
+): { complete: boolean; completedParts: number } {
+  if (
+    !session.splitGroupProgress ||
+    session.splitGroupProgress.splitGroupId !== splitPart.splitGroupId
+  ) {
+    session.splitGroupProgress = {
+      splitGroupId: splitPart.splitGroupId,
+      splitTotal: splitPart.splitTotal,
+      completedParts: 0,
+      originalSourceIds: [...splitPart.originalSourceIds],
+    };
+  }
+
+  session.splitGroupProgress.completedParts = Math.max(
+    session.splitGroupProgress.completedParts + 1,
+    splitPart.splitIndex
+  );
+
+  return {
+    complete: session.splitGroupProgress.completedParts >= session.splitGroupProgress.splitTotal,
+    completedParts: session.splitGroupProgress.completedParts,
+  };
+}
+
+function splitLogContext(splitPart: SplitDrainMetadata): Record<string, unknown> {
+  return {
+    splitGroupId: splitPart.splitGroupId,
+    splitIndex: splitPart.splitIndex,
+    splitTotal: splitPart.splitTotal,
+    originalSourceIds: splitPart.originalSourceIds,
+    parentMessageType: splitPart.parentMessageType,
+  };
 }
 
 function normalizeSummaryForStorage(summary: ParsedSummary | null): {

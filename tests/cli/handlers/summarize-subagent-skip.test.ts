@@ -9,12 +9,13 @@ mock.module('../../../src/shared/SettingsDefaultsManager.js', () => ({
       return '';
     },
     getInt: () => 0,
-    loadFromFile: () => ({ CLAUDE_MEM_EXCLUDED_PROJECTS: [] }),
+    loadFromFile: () => ({ CLAUDE_MEM_EXCLUDED_PROJECTS: '' }),
   },
 }));
 
 const workerCallLog: Array<{ path: string; options: any }> = [];
 mock.module('../../../src/shared/worker-utils.js', () => ({
+  fetchWithTimeout: (url: string, init: RequestInit = {}, _timeoutMs: number) => fetch(url, init),
   ensureWorkerRunning: () => Promise.resolve(true),
   getWorkerPort: () => 37777,
   workerHttpRequest: (apiPath: string, options?: any) => {
@@ -23,6 +24,13 @@ mock.module('../../../src/shared/worker-utils.js', () => ({
       `workerHttpRequest MUST NOT be called in subagent context (called with ${apiPath})`
     );
   },
+  executeWithWorkerFallback: async (apiPath: string, method: string, body: unknown) => {
+    workerCallLog.push({ path: apiPath, options: { method, body } });
+    throw new Error(
+      `executeWithWorkerFallback MUST NOT be called in subagent context (called with ${apiPath})`
+    );
+  },
+  isWorkerFallback: (_result: unknown) => false,
 }));
 
 import { logger } from '../../../src/utils/logger.js';

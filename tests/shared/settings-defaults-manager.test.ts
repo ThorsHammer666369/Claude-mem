@@ -280,12 +280,20 @@ describe('SettingsDefaultsManager', () => {
 
       expect(defaults.CLAUDE_MEM_DATA_DIR).toBeDefined();
       expect(defaults.CLAUDE_MEM_LOG_LEVEL).toBeDefined();
+
+      expect(defaults.CLAUDE_MEM_LLM_QUEUE_MODE).toBe('auto');
+      expect(defaults.CLAUDE_MEM_LLM_MIN_SEND_INTERVAL_MS).toBe('0');
+      expect(defaults.CLAUDE_MEM_LLM_MAX_ATTEMPTS).toBe('3');
+      expect(defaults.CLAUDE_MEM_QUEUE_METRICS_ENABLED).toBe('true');
+      expect(defaults.CLAUDE_MEM_LLM_CONTEXT_SPLIT_ENABLED).toBe('true');
+      expect(defaults.CLAUDE_MEM_LLM_CONTEXT_MAX_CHARS).toBe('50000');
+      expect(defaults.CLAUDE_MEM_LLM_CONTEXT_SPLIT_MAX_PARTS).toBe('20');
     });
   });
 
   describe('get', () => {
     it('should return default value for key', () => {
-      expect(SettingsDefaultsManager.get('CLAUDE_MEM_MODEL')).toBe('claude-sonnet-4-6');
+      expect(SettingsDefaultsManager.get('CLAUDE_MEM_MODEL')).toBe('claude-haiku-4-5-20251001');
       const expectedPort = String(37700 + ((process.getuid?.() ?? 77) % 100));
       expect(SettingsDefaultsManager.get('CLAUDE_MEM_WORKER_PORT')).toBe(expectedPort);
     });
@@ -316,6 +324,7 @@ describe('SettingsDefaultsManager', () => {
       originalEnv.CLAUDE_MEM_WORKER_PORT = process.env.CLAUDE_MEM_WORKER_PORT;
       originalEnv.CLAUDE_MEM_MODEL = process.env.CLAUDE_MEM_MODEL;
       originalEnv.CLAUDE_MEM_LOG_LEVEL = process.env.CLAUDE_MEM_LOG_LEVEL;
+      originalEnv.CLAUDE_MEM_LLM_CONTEXT_MAX_CHARS = process.env.CLAUDE_MEM_LLM_CONTEXT_MAX_CHARS;
     });
 
     afterEach(() => {
@@ -333,6 +342,11 @@ describe('SettingsDefaultsManager', () => {
         delete process.env.CLAUDE_MEM_LOG_LEVEL;
       } else {
         process.env.CLAUDE_MEM_LOG_LEVEL = originalEnv.CLAUDE_MEM_LOG_LEVEL;
+      }
+      if (originalEnv.CLAUDE_MEM_LLM_CONTEXT_MAX_CHARS === undefined) {
+        delete process.env.CLAUDE_MEM_LLM_CONTEXT_MAX_CHARS;
+      } else {
+        process.env.CLAUDE_MEM_LLM_CONTEXT_MAX_CHARS = originalEnv.CLAUDE_MEM_LLM_CONTEXT_MAX_CHARS;
       }
     });
 
@@ -354,6 +368,14 @@ describe('SettingsDefaultsManager', () => {
       const result = SettingsDefaultsManager.loadFromFile(settingsPath);
 
       expect(result.CLAUDE_MEM_WORKER_PORT).toBe('99999');
+    });
+
+    it('should apply context split env var overrides', () => {
+      process.env.CLAUDE_MEM_LLM_CONTEXT_MAX_CHARS = '75000';
+
+      const result = SettingsDefaultsManager.loadFromFile(settingsPath);
+
+      expect(result.CLAUDE_MEM_LLM_CONTEXT_MAX_CHARS).toBe('75000');
     });
 
     it('should use file setting when env var is not set', () => {

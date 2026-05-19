@@ -6,6 +6,8 @@ import { readFileSync, statSync, existsSync } from 'fs';
 import { logger } from '../../../../utils/logger.js';
 import { getPackageRoot, paths } from '../../../../shared/paths.js';
 import { getWorkerPort } from '../../../../shared/worker-utils.js';
+import { SettingsDefaultsManager } from '../../../../shared/SettingsDefaultsManager.js';
+import { USER_SETTINGS_PATH } from '../../../../shared/paths.js';
 import { PaginationHelper } from '../../PaginationHelper.js';
 import { DatabaseManager } from '../../DatabaseManager.js';
 import { SessionManager } from '../../SessionManager.js';
@@ -17,6 +19,8 @@ import { normalizePlatformSource } from '../../../../shared/platform-source.js';
 import { getObservationsByFilePath } from '../../../sqlite/observations/get.js';
 import { getFirstObservationCreatedAt } from '../../../sqlite/observations/recent.js';
 import { getUptimeSeconds } from '../../../../shared/uptime.js';
+import { parseSmartLlmDrainOptions } from '../../llm/SmartLlmDrainSettings.js';
+import { getSmartLlmDrainMetricsSnapshot } from '../../llm/SmartLlmDrainMetricsRegistry.js';
 
 const integerArrayLike = z.preprocess((value) => {
   if (Array.isArray(value)) return value;
@@ -103,6 +107,7 @@ export class DataRoutes extends BaseRouteHandler {
     app.get('/api/projects', this.handleGetProjects.bind(this));
 
     app.get('/api/processing-status', this.handleGetProcessingStatus.bind(this));
+    app.get('/api/queue/status', this.handleGetQueueStatus.bind(this));
     app.post('/api/processing', validateBody(setProcessingSchema), this.handleSetProcessing.bind(this));
 
     app.post('/api/import', validateBody(importSchema), this.handleImport.bind(this));
@@ -275,6 +280,35 @@ export class DataRoutes extends BaseRouteHandler {
     const isProcessing = await this.sessionManager.isAnySessionProcessing();
     const queueDepth = await this.sessionManager.getTotalActiveWork(); 
     res.json({ isProcessing, queueDepth });
+  });
+
+  private handleGetQueueStatus = this.wrapHandler(async (_req: Request, res: Response): Promise<void> => {
+    const queueStats = await this.sessionManager.getQueueStats();
+    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    const drainOptions = parseSmartLlmDrainOptions(settings);
+    const providerMetrics = getSmartLlmDrainMetricsSnapshot();
+
+    res.json({
+      ...queueStats,
+      provider: providerMetrics ?? {
+        provider: null,
+        mode: drainOptions.mode,
+        minSendIntervalMs: drainOptions.minSendIntervalMs,
+        currentBackoffMs: drainOptions.minSendIntervalMs,
+        currentMaxBatchItems: drainOptions.maxBatchItems,
+        lastLatencyMs: 0,
+        emptyResponseCount: 0,
+        parserFailureCount: 0,
+        timeoutCount: 0,
+        healthyResponseCount: 0,
+        updatedAtEpochMs: null,
+      },
+      pressure: {
+        highWatermark: drainOptions.highWatermark,
+        criticalWatermark: drainOptions.criticalWatermark,
+        dropPolicy: drainOptions.dropPolicy,
+      },
+    });
   });
 
   private handleSetProcessing = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {

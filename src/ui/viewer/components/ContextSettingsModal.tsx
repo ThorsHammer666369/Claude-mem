@@ -459,6 +459,177 @@ export function ContextSettingsModal({
                 />
               </FormField>
 
+              <div className="display-subsection">
+                <span className="subsection-label">LLM Queue & Timing</span>
+                <FormField
+                  label="Concurrency"
+                  tooltip="Maximum active provider agent sessions"
+                >
+                  <input
+                    type="number"
+                    min="1"
+                    max="16"
+                    value={formState.CLAUDE_MEM_MAX_CONCURRENT_AGENTS || '2'}
+                    onChange={(e) => updateSetting('CLAUDE_MEM_MAX_CONCURRENT_AGENTS', e.target.value)}
+                  />
+                </FormField>
+                <FormField
+                  label="Queue mode"
+                  tooltip="Provider drain behavior for queued observations"
+                >
+                  <select
+                    value={formState.CLAUDE_MEM_LLM_QUEUE_MODE || 'auto'}
+                    onChange={(e) => updateSetting('CLAUDE_MEM_LLM_QUEUE_MODE', e.target.value)}
+                  >
+                    <option value="off">Off</option>
+                    <option value="auto">Auto</option>
+                    <option value="local_safe">Local safe</option>
+                  </select>
+                </FormField>
+                <FormField
+                  label="Min interval"
+                  tooltip="Minimum milliseconds between local-safe provider sends"
+                >
+                  <input
+                    type="number"
+                    min="0"
+                    max="60000"
+                    value={formState.CLAUDE_MEM_LLM_MIN_SEND_INTERVAL_MS || '0'}
+                    onChange={(e) => updateSetting('CLAUDE_MEM_LLM_MIN_SEND_INTERVAL_MS', e.target.value)}
+                  />
+                </FormField>
+                <FormField
+                  label="Batch items"
+                  tooltip="Maximum compatible observations per batch"
+                >
+                  <input
+                    type="number"
+                    min="1"
+                    max="100"
+                    value={formState.CLAUDE_MEM_LLM_BATCH_MAX_ITEMS || '3'}
+                    onChange={(e) => updateSetting('CLAUDE_MEM_LLM_BATCH_MAX_ITEMS', e.target.value)}
+                  />
+                </FormField>
+                <FormField
+                  label="Batch chars"
+                  tooltip="Maximum prompt characters before splitting or fallback"
+                >
+                  <input
+                    type="number"
+                    min="1000"
+                    max="1000000"
+                    value={formState.CLAUDE_MEM_LLM_BATCH_MAX_CHARS || '24000'}
+                    onChange={(e) => updateSetting('CLAUDE_MEM_LLM_BATCH_MAX_CHARS', e.target.value)}
+                  />
+                </FormField>
+                <FormField
+                  label="Coalesce window"
+                  tooltip="Milliseconds for grouping repeated low-value observations"
+                >
+                  <input
+                    type="number"
+                    min="0"
+                    max="600000"
+                    value={formState.CLAUDE_MEM_LLM_COALESCE_WINDOW_MS || '5000'}
+                    onChange={(e) => updateSetting('CLAUDE_MEM_LLM_COALESCE_WINDOW_MS', e.target.value)}
+                  />
+                </FormField>
+                <FormField
+                  label="Max attempts"
+                  tooltip="Retry cap before failed queue rows are dead-lettered"
+                >
+                  <input
+                    type="number"
+                    min="1"
+                    max="20"
+                    value={formState.CLAUDE_MEM_LLM_MAX_ATTEMPTS || '3'}
+                    onChange={(e) => updateSetting('CLAUDE_MEM_LLM_MAX_ATTEMPTS', e.target.value)}
+                  />
+                </FormField>
+                <FormField
+                  label="Context chars"
+                  tooltip="Maximum prompt characters before context splitting"
+                >
+                  <input
+                    type="number"
+                    min="1000"
+                    max="1000000"
+                    value={formState.CLAUDE_MEM_LLM_CONTEXT_MAX_CHARS || '50000'}
+                    onChange={(e) => updateSetting('CLAUDE_MEM_LLM_CONTEXT_MAX_CHARS', e.target.value)}
+                  />
+                </FormField>
+                <FormField
+                  label="Split parts"
+                  tooltip="Maximum parts for one oversized queued observation"
+                >
+                  <input
+                    type="number"
+                    min="1"
+                    max="100"
+                    value={formState.CLAUDE_MEM_LLM_CONTEXT_SPLIT_MAX_PARTS || '20'}
+                    onChange={(e) => updateSetting('CLAUDE_MEM_LLM_CONTEXT_SPLIT_MAX_PARTS', e.target.value)}
+                  />
+                </FormField>
+                <FormField
+                  label="High watermark"
+                  tooltip="Queue depth where batching and coalescing become more aggressive"
+                >
+                  <input
+                    type="number"
+                    min="1"
+                    max="1000000"
+                    value={formState.CLAUDE_MEM_QUEUE_HIGH_WATERMARK || '200'}
+                    onChange={(e) => updateSetting('CLAUDE_MEM_QUEUE_HIGH_WATERMARK', e.target.value)}
+                  />
+                </FormField>
+                <FormField
+                  label="Critical watermark"
+                  tooltip="Queue depth treated as critical pressure"
+                >
+                  <input
+                    type="number"
+                    min="1"
+                    max="1000000"
+                    value={formState.CLAUDE_MEM_QUEUE_CRITICAL_WATERMARK || '1000'}
+                    onChange={(e) => updateSetting('CLAUDE_MEM_QUEUE_CRITICAL_WATERMARK', e.target.value)}
+                  />
+                </FormField>
+                <FormField
+                  label="Drop policy"
+                  tooltip="Policy used when queue pressure requires low-value compression"
+                >
+                  <select
+                    value={formState.CLAUDE_MEM_QUEUE_DROP_POLICY || 'coalesce_low_value'}
+                    onChange={(e) => updateSetting('CLAUDE_MEM_QUEUE_DROP_POLICY', e.target.value)}
+                  >
+                    <option value="coalesce_low_value">Coalesce low value</option>
+                  </select>
+                </FormField>
+                <div className="toggle-group" style={{ marginTop: '8px' }}>
+                  <ToggleSwitch
+                    id="llm-adaptive-backoff"
+                    label="Adaptive backoff"
+                    description="Adjust delay and batch size after provider health changes"
+                    checked={formState.CLAUDE_MEM_LLM_ADAPTIVE_BACKOFF === 'true'}
+                    onChange={() => toggleBoolean('CLAUDE_MEM_LLM_ADAPTIVE_BACKOFF')}
+                  />
+                  <ToggleSwitch
+                    id="llm-context-split"
+                    label="Context splitting"
+                    description="Split oversized queued observations before provider sends"
+                    checked={formState.CLAUDE_MEM_LLM_CONTEXT_SPLIT_ENABLED === 'true'}
+                    onChange={() => toggleBoolean('CLAUDE_MEM_LLM_CONTEXT_SPLIT_ENABLED')}
+                  />
+                  <ToggleSwitch
+                    id="queue-metrics"
+                    label="Queue metrics"
+                    description="Expose queue pressure and drain telemetry"
+                    checked={formState.CLAUDE_MEM_QUEUE_METRICS_ENABLED === 'true'}
+                    onChange={() => toggleBoolean('CLAUDE_MEM_QUEUE_METRICS_ENABLED')}
+                  />
+                </div>
+              </div>
+
               <div className="toggle-group" style={{ marginTop: '12px' }}>
                 <ToggleSwitch
                   id="show-last-summary"

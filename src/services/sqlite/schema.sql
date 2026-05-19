@@ -121,7 +121,9 @@ CREATE INDEX IF NOT EXISTS idx_summaries_merged_into          ON session_summari
 -- ─────────────────────────────────────────────────────────────────────
 -- pending_messages: persistent work queue for SDK messages.
 -- UNIQUE(content_session_id, tool_use_id) preserves ingestion pairing without
--- any legacy worker_pid or stale-reset epoch column.
+-- any legacy worker_pid or stale-reset epoch column. Failed or skipped queue
+-- rows are copied into pending_message_dead_letters before removal from the
+-- active queue.
 -- ─────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS pending_messages (
   id                       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -142,6 +144,12 @@ CREATE TABLE IF NOT EXISTS pending_messages (
   created_at_epoch         INTEGER NOT NULL,
   agent_type               TEXT,
   agent_id                 TEXT,
+  attempt_count            INTEGER NOT NULL DEFAULT 0,
+  last_error               TEXT,
+  available_at_epoch_ms    INTEGER,
+  status_reason            TEXT,
+  priority                 INTEGER NOT NULL DEFAULT 50,
+  size_chars               INTEGER NOT NULL DEFAULT 0,
   FOREIGN KEY (session_db_id) REFERENCES sdk_sessions(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_pending_messages_session        ON pending_messages(session_db_id);
@@ -150,6 +158,24 @@ CREATE INDEX IF NOT EXISTS idx_pending_messages_claude_session ON pending_messag
 CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_session_tool
   ON pending_messages(content_session_id, tool_use_id)
   WHERE tool_use_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS pending_message_dead_letters (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  original_message_id  INTEGER NOT NULL,
+  session_db_id        INTEGER NOT NULL,
+  content_session_id   TEXT    NOT NULL,
+  message_type         TEXT    NOT NULL,
+  tool_name            TEXT,
+  source_payload       TEXT    NOT NULL,
+  attempt_count        INTEGER NOT NULL,
+  status_reason        TEXT    NOT NULL,
+  last_error           TEXT,
+  failed_at_epoch_ms   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pending_dead_letters_session
+  ON pending_message_dead_letters(session_db_id);
+CREATE INDEX IF NOT EXISTS idx_pending_dead_letters_failed
+  ON pending_message_dead_letters(failed_at_epoch_ms DESC);
 
 -- ─────────────────────────────────────────────────────────────────────
 -- user_prompts: per-prompt history (UI + FTS search).
